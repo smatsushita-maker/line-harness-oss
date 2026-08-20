@@ -335,38 +335,51 @@ function resolvePackageManagerInvocation(
   segment: string,
   depth: number,
 ): void {
-  let tokens = stripEnvAssignments(normalizeSegment(segment).split(/\s+/).filter(Boolean));
-  // Strip a leading `npx`/`corepack` shim (with its own no-value flags) so
-  // `npx pnpm …` / `corepack pnpm …` resolve like `pnpm …`.
-  while (tokens[0] === 'npx' || tokens[0] === 'corepack') {
-    let j = 1;
-    while (j < tokens.length && tokens[j].startsWith('-')) {
-      if (tokens[j] === '-p' || tokens[j] === '--package') j += 2;
-      else j += 1;
+  const tokens = stripEnvAssignments(normalizeSegment(segment).split(/\s+/).filter(Boolean));
+  // Reduce a token to its bare launcher name so a path-qualified or
+  // extension-suffixed launcher is still recognized: `./node_modules/.bin/pnpm`,
+  // `/usr/bin/pnpm`, `$(npm bin)/pnpm`, `pnpm.cmd` all → `pnpm`.
+  const launcherName = (t: string): string =>
+    path.basename(t).replace(/[)'"]+$/g, '').replace(/\.(cmd|exe|ps1|bat)$/i, '');
+
+  // Locate the package-manager launcher: the first token (past any
+  // `npx`/`corepack` shim) whose bare name is pnpm/npm/yarn. A path-qualified
+  // launcher may appear at any position (e.g. after a `$(…)` substitution).
+  let start = 0;
+  while (tokens[start] === 'npx' || tokens[start] === 'corepack') {
+    start += 1;
+    while (start < tokens.length && tokens[start].startsWith('-')) {
+      start += tokens[start] === '-p' || tokens[start] === '--package' ? 2 : 1;
     }
-    tokens = tokens.slice(j);
   }
-  if (tokens.length === 0) return;
-  const tool = tokens[0];
-  if (tool !== 'pnpm' && tool !== 'npm' && tool !== 'yarn') return;
+  let launcherIdx = -1;
+  for (let k = start; k < tokens.length; k++) {
+    const name = launcherName(tokens[k]);
+    if ((name === 'pnpm' || name === 'npm' || name === 'yarn') && (k === start || tokens[k].includes('/'))) {
+      launcherIdx = k;
+      break;
+    }
+  }
+  if (launcherIdx === -1) return;
+  const tool = launcherName(tokens[launcherIdx]);
 
   const packages = getPackages(ctx);
   const filters: string[] = [];
   const dirSelectors: string[] = [];
   let recursive = false;
-  let i = 1;
+  let i = launcherIdx + 1;
   let sawRunKeyword = false;
   let script: string | undefined;
 
   // `yarn workspace <pkg> <script>` selects one package; `yarn workspaces
   // foreach … run <script>` runs it across every package (like `-r`).
-  if (tool === 'yarn' && tokens[1] === 'workspace') {
-    filters.push(tokens[2] ?? '');
-    i = 3;
+  if (tool === 'yarn' && tokens[launcherIdx + 1] === 'workspace') {
+    filters.push(tokens[launcherIdx + 2] ?? '');
+    i = launcherIdx + 3;
     sawRunKeyword = true;
-  } else if (tool === 'yarn' && tokens[1] === 'workspaces' && tokens[2] === 'foreach') {
+  } else if (tool === 'yarn' && tokens[launcherIdx + 1] === 'workspaces' && tokens[launcherIdx + 2] === 'foreach') {
     recursive = true;
-    i = 3;
+    i = launcherIdx + 3;
   }
 
   const selectorFlag = (name: string) => name === '--dir' || name === '-C' || name === '--prefix';

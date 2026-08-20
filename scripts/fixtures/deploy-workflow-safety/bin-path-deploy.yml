@@ -1,0 +1,7 @@
+name: Fixture direct-binary launcher deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./node_modules/.bin/pnpm --filter worker deploy
