@@ -1,0 +1,7 @@
+name: Fixture npx pnpm deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx pnpm --filter worker deploy

@@ -55,6 +55,7 @@ jobs:
           [ "$HAS_D1_DATABASE_ID" = "true" ] || { echo "::error::secret D1_DATABASE_ID is not configured (needed to patch the built wrangler config)"; ok=0; }
           [ -n "$WORKER_NAME" ] || { echo "::error::repository variable WORKER_NAME is not set — refusing to deploy to a placeholder Worker name"; ok=0; }
           [ "$WORKER_NAME" != "your-worker-name" ] || { echo "::error::repository variable WORKER_NAME is still the placeholder value"; ok=0; }
+          case "$WORKER_NAME" in *[!a-z0-9-]*) echo "::error::WORKER_NAME may only contain lowercase letters, digits and hyphens (it is passed as a CLI arg)"; ok=0;; esac
           [ -n "$VITE_LIFF_ID" ] || { echo "::error::repository variable VITE_LIFF_ID is not set — the LIFF client would build without its LIFF ID"; ok=0; }
           [ -n "$VITE_CALENDAR_CONNECTION_ID" ] || { echo "::error::repository variable VITE_CALENDAR_CONNECTION_ID is not set — the booking UI would silently break"; ok=0; }
           [ "$ok" = "1" ]
@@ -97,6 +98,10 @@ jobs:
             -e "s|\"database_name\":\"[^\"]*\"|\"database_name\":\"${D1_DATABASE_NAME}\"|g" \
             -e "s|\"database_id\":\"[^\"]*\"|\"database_id\":\"${D1_DATABASE_ID}\"|g" \
             dist/line_harness/wrangler.json
+          # Fail if the substitution did not take (e.g. the built config's JSON
+          # formatting changed), rather than silently deploying the dev binding.
+          grep -q "\"database_id\":\"${D1_DATABASE_ID}\"" dist/line_harness/wrangler.json \
+            || { echo "::error::wrangler.json D1 patch did not apply — refusing to deploy"; exit 1; }
           # Inject admin CORS vars into the deployed config when ADMIN_ORIGIN is
           # set. ADMIN_ALLOW_CROSS_SITE defaults to "true" (SameSite=None; Secure
           # cookies) since cross-origin admin/API is the case that needs it.

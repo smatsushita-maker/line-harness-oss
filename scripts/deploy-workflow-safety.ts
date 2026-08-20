@@ -95,10 +95,28 @@ const DEPLOY_SCOPED_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
 // `node -e` is deliberately NOT flagged: release.yml uses it legitimately for
 // inline JSON parsing, and its literal payload sits in the same command
 // segment so the DB-mutation patterns above still scan it. Only constructs
-// that execute text assembled at runtime (eval, shell -c) are rejected.
+// that execute text assembled at runtime (eval, shell -c, pipe-to-shell,
+// sourcing) are rejected.
 const DYNAMIC_EXEC_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/(?:^|[\s;("'`])eval(?:$|[\s;)"'`])/, 'eval'],
-  [/\b(?:bash|sh)\s+(?:-\S+\s+)*-c\b/, 'shell -c dynamic command'],
+  [/\b(?:bash|sh|zsh)\s+(?:-\S+\s+)*-c\b/, 'shell -c dynamic command'],
+  [/\|\s*(?:sudo\s+)?(?:bash|sh|zsh)\b/, 'pipe to shell'],
+  // `source <path>` / `. <path>` where the arg is file-like (has a slash or a
+  // shell extension) — avoids matching jq/JS constructs such as `else . end`.
+  [/(?:^|[\s;&])(?:source|\.)\s+(?:[\w.~$/-]*\/[\w.~$/-]*|[\w.~$-]+\.(?:sh|bash|zsh|env))/, 'sourcing a script'],
+];
+
+// Interpreters that run an arbitrary script FILE. Inside a Cloudflare-mutating
+// job such a file cannot be audited (its contents live outside the workflow),
+// so — except for the pinned deploy-safety audit itself — running one is a
+// fail-closed violation. Inline `-e`/`-p`/`--eval` payloads are handled by the
+// pattern scan over the same segment and are not treated as file execution.
+const SCRIPT_INTERPRETER =
+  /\b(node|deno|bun|tsx|ts-node|bash|sh|zsh|python3?|ruby|perl|php)\s+(?:-(?!e\b|-eval\b|p\b)\S+\s+)*([^\s]*(?:\/[^\s]*|\.(?:ts|js|mjs|cjs|sh|py|rb|pl|php)))/;
+
+/** Script-file executions that are allowed inside a mutating job. */
+const AUDIT_EXEC_ALLOWLIST: readonly RegExp[] = [
+  /scripts\/deploy-workflow-safety\.ts\b/,
 ];
 
 /** Actions a Cloudflare-mutating workflow is allowed to use. */
@@ -134,9 +152,37 @@ interface ScanContext {
   mutations: WranglerMutation[];
   /** Deploy-scoped pattern hits, promoted to violations iff the workflow mutates Cloudflare. */
   deployScopedHits: Violation[];
+  /** Script-file execs in a Cloudflare-credentialed step, promoted iff that job mutates Cloudflare. */
+  jobExecCandidates: Violation[];
+  /** True while scanning a step (and its resolved scripts) that holds Cloudflare credentials. */
+  currentStepHasCfCreds: boolean;
   externalActions: Array<{ location: string; uses: string }>;
   visitedScripts: Set<string>;
   visitedFiles: Set<string>;
+}
+
+/** Does this env block put Cloudflare deploy credentials in scope? */
+function hasCloudflareCredentials(env: unknown): boolean {
+  if (!env || typeof env !== 'object') return false;
+  for (const [name, raw] of Object.entries(env as Record<string, unknown>)) {
+    if (/CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID|CF_API_TOKEN|WRANGLER/i.test(name)) return true;
+    if (/secrets\.(?:CLOUDFLARE|CF_|WRANGLER)/i.test(String(raw ?? ''))) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize a command segment before pattern matching so trivial shell
+ * quoting cannot hide a banned construct: strip quotes/backticks (so
+ * `wrangler "d1"` and `d''1` read as `wrangler d1`/`d1`), collapse `${IFS}`
+ * word-splitting tricks to spaces, and drop in-word backslash escapes
+ * (`d\1` → `d1`). Used only for matching, never for execution.
+ */
+export function normalizeSegment(segment: string): string {
+  return segment
+    .replace(/\$\{IFS\}/g, ' ')
+    .replace(/['"`]/g, '')
+    .replace(/\\(?=\S)/g, '');
 }
 
 /**
@@ -193,10 +239,11 @@ function addViolation(ctx: ScanContext, location: string, rule: string, detail: 
   ctx.violations.push({ file: ctx.file, location, rule, detail });
 }
 
-function scanSegmentPatterns(ctx: ScanContext, location: string, segment: string): void {
+function scanSegmentPatterns(ctx: ScanContext, location: string, rawSegment: string): void {
+  const segment = normalizeSegment(rawSegment);
   for (const [pattern, label] of DB_MUTATION_PATTERNS) {
     if (pattern.test(segment)) {
-      addViolation(ctx, location, 'db-mutation', `${label} in: ${segment}`);
+      addViolation(ctx, location, 'db-mutation', `${label} in: ${rawSegment}`);
     }
   }
   for (const [pattern, label] of DEPLOY_SCOPED_PATTERNS) {
@@ -205,18 +252,28 @@ function scanSegmentPatterns(ctx: ScanContext, location: string, segment: string
         file: ctx.file,
         location,
         rule: 'db-mutation',
-        detail: `${label} in a deploy workflow: ${segment}`,
+        detail: `${label} in a deploy workflow: ${rawSegment}`,
       });
     }
   }
   for (const [pattern, label] of DYNAMIC_EXEC_PATTERNS) {
     if (pattern.test(segment)) {
-      addViolation(ctx, location, 'dynamic-exec', `${label} in: ${segment}`);
+      addViolation(ctx, location, 'dynamic-exec', `${label} in: ${rawSegment}`);
     }
+  }
+  const interp = SCRIPT_INTERPRETER.exec(segment);
+  if (interp && ctx.currentStepHasCfCreds && !AUDIT_EXEC_ALLOWLIST.some((re) => re.test(segment))) {
+    ctx.jobExecCandidates.push({
+      file: ctx.file,
+      location,
+      rule: 'unauditable-exec',
+      detail: `a step holding Cloudflare credentials runs an unauditable script file (${interp[1]} ${interp[2]}) — failing closed: ${rawSegment}`,
+    });
   }
 }
 
-function detectWranglerMutations(ctx: ScanContext, segment: string): void {
+function detectWranglerMutations(ctx: ScanContext, rawSegment: string): void {
+  const segment = normalizeSegment(rawSegment);
   const pages = /\bwrangler\s+pages\s+deploy\b/i.test(segment);
   if (pages) {
     ctx.mutations.push({ kind: 'wrangler pages deploy', segment, pages: true });
@@ -248,23 +305,15 @@ function resolveScriptText(
   pkg: PackageInfo,
   script: string,
   depth: number,
-  required: boolean,
 ): void {
-  const key = `${pkg.name} ${script}`;
+  const key = `${pkg.name} ${script}`;
   if (ctx.visitedScripts.has(key)) return;
   ctx.visitedScripts.add(key);
   const text = pkg.scripts[script];
-  if (text === undefined) {
-    if (required) {
-      addViolation(
-        ctx,
-        location,
-        'unresolvable-script',
-        `script "${script}" not found in package "${pkg.name}" — cannot audit, failing closed`,
-      );
-    }
-    return;
-  }
+  // A script the package does not define simply does not run — nothing to
+  // audit. (An unresolvable *package* is the fail-closed case, handled by the
+  // caller.)
+  if (text === undefined) return;
   scanExecutableText(ctx, `${location} → ${pkg.name}#${script}`, text, depth + 1);
 }
 
@@ -274,17 +323,35 @@ function resolvePackageManagerInvocation(
   segment: string,
   depth: number,
 ): void {
-  const tokens = stripEnvAssignments(segment.split(/\s+/));
+  let tokens = stripEnvAssignments(normalizeSegment(segment).split(/\s+/).filter(Boolean));
+  // Strip a leading `npx`/`pnpm dlx` shim (with its own no-value flags) so
+  // `npx pnpm --filter worker deploy` resolves like `pnpm ...`.
+  if (tokens[0] === 'npx') {
+    let j = 1;
+    while (j < tokens.length && tokens[j].startsWith('-')) {
+      if (tokens[j] === '-p' || tokens[j] === '--package') j += 2;
+      else j += 1;
+    }
+    tokens = tokens.slice(j);
+  }
   if (tokens.length === 0) return;
   const tool = tokens[0];
   if (tool !== 'pnpm' && tool !== 'npm' && tool !== 'yarn') return;
 
   const packages = getPackages(ctx);
   const filters: string[] = [];
+  const dirSelectors: string[] = [];
   let recursive = false;
   let i = 1;
   let sawRunKeyword = false;
   let script: string | undefined;
+
+  // `yarn workspace <pkg> <script>` selects a package by name.
+  if (tool === 'yarn' && tokens[1] === 'workspace') {
+    filters.push(tokens[2] ?? '');
+    i = 3;
+    sawRunKeyword = true;
+  }
 
   while (i < tokens.length) {
     const token = tokens[i];
@@ -298,15 +365,15 @@ function resolvePackageManagerInvocation(
       i += 1;
       continue;
     }
+    if (token === '--dir' || token === '-C' || token === '--prefix') {
+      // Working-directory selector — pnpm runs the script in that package.
+      dirSelectors.push(tokens[i + 1] ?? '');
+      i += 2;
+      continue;
+    }
     if (token === '-r' || token === '--recursive') {
       recursive = true;
       i += 1;
-      continue;
-    }
-    if (token === '--dir' || token === '-C' || token === '--prefix') {
-      // Value-taking flags before the subcommand — consume the value too so
-      // it is not mistaken for the script name.
-      i += 2;
       continue;
     }
     if (token.startsWith('-')) {
@@ -325,42 +392,47 @@ function resolvePackageManagerInvocation(
   if (script === undefined) return;
   if (script === 'exec' || script === 'dlx') {
     // The remainder is plain command text (e.g. `pnpm --filter worker exec
-    // wrangler ...`) and is already covered by the pattern scan over this
-    // same segment.
+    // wrangler ...`) and is already covered by the pattern/interpreter scan
+    // over this same segment.
     return;
   }
+  // Package-manager builtins (`pack`, `publish`, …) are not workspace
+  // scripts, even with a `--filter`/`--dir` selector, unless an explicit
+  // `run` keyword forces script interpretation.
   if (!sawRunKeyword && PACKAGE_MANAGER_BUILTINS.has(script)) {
     return;
   }
 
-  // `pnpm <name>` without `run` falls back to executing a binary when no
-  // script of that name exists (e.g. `pnpm tsx scripts/foo.ts`), so a
-  // missing script is only a hard failure for explicit `run` invocations —
-  // the fallback command text is still pattern-scanned above either way.
-  const missingIsViolation = sawRunKeyword || tool === 'npm';
+  // A missing SCRIPT in a resolved package is safe — pnpm/npm simply run
+  // nothing. A missing PACKAGE (an unresolvable `--filter`/`--dir`) is the
+  // fail-closed case: we cannot see what a matched package would have run.
+  const selectors: Array<{ kind: 'filter' | 'dir'; value: string }> = [
+    ...filters.map((value) => ({ kind: 'filter' as const, value })),
+    ...dirSelectors.map((value) => ({ kind: 'dir' as const, value })),
+  ];
 
-  if (filters.length > 0) {
-    for (const filter of filters) {
-      const target = packages.find(
-        (p) => p.name === filter || path.basename(p.dir) === filter,
+  if (selectors.length > 0) {
+    for (const sel of selectors) {
+      const target = packages.find((p) =>
+        sel.kind === 'filter'
+          ? p.name === sel.value || path.basename(p.dir) === sel.value
+          : path.normalize(p.dir) === path.normalize(sel.value) || path.basename(p.dir) === sel.value,
       );
       if (!target) {
         addViolation(
           ctx,
           location,
           'unresolvable-script',
-          `--filter "${filter}" matches no workspace package — cannot audit "${script}", failing closed`,
+          `${sel.kind} "${sel.value}" matches no workspace package — cannot audit "${script}", failing closed`,
         );
         continue;
       }
-      resolveScriptText(ctx, location, target, script, depth, missingIsViolation);
+      resolveScriptText(ctx, location, target, script, depth);
     }
     return;
   }
   if (recursive) {
-    // pnpm -r runs the script in every package that defines it and skips
-    // the rest, so a missing script is not a violation here.
-    for (const pkg of packages) resolveScriptText(ctx, location, pkg, script, depth, false);
+    for (const pkg of packages) resolveScriptText(ctx, location, pkg, script, depth);
     return;
   }
   const root = packages.find((p) => p.dir === '.');
@@ -368,7 +440,7 @@ function resolvePackageManagerInvocation(
     addViolation(ctx, location, 'unresolvable-script', 'workspace root package.json not found');
     return;
   }
-  resolveScriptText(ctx, location, root, script, depth, missingIsViolation);
+  resolveScriptText(ctx, location, root, script, depth);
 }
 
 function scanExecutableText(ctx: ScanContext, location: string, text: string, depth: number): void {
@@ -454,22 +526,57 @@ function auditLocalAction(ctx: ScanContext, location: string, usesPath: string, 
 function auditStep(ctx: ScanContext, jobId: string, step: any, index: number): void {
   const location = `job "${jobId}" step[${index}]${step?.name ? ` (${step.name})` : ''}`;
   scanEnvValues(ctx, location, step?.env);
+  const previousCredState = ctx.currentStepHasCfCreds;
+  const withInputs = step?.with && typeof step.with === 'object' ? step.with : {};
+  // A wrangler-action supplies its token via `with.apiToken`, not `env`.
+  ctx.currentStepHasCfCreds =
+    ctx.currentStepHasCfCreds ||
+    hasCloudflareCredentials(step?.env) ||
+    hasCloudflareCredentials(withInputs);
+
   if (typeof step?.run === 'string') {
     scanExecutableText(ctx, location, step.run, 0);
   }
   const uses = typeof step?.uses === 'string' ? step.uses : undefined;
-  if (!uses) return;
-  if (uses.startsWith('./')) {
+  if (uses && uses.startsWith('./')) {
     auditLocalAction(ctx, location, uses, 0);
-    return;
+  } else if (uses) {
+    ctx.externalActions.push({ location, uses });
+
+    // Scan every string input to any action: preCommands/postCommands run in a
+    // shell, and github-script's `script` is JS that can hit the D1 REST API.
+    for (const [key, value] of Object.entries(withInputs as Record<string, unknown>)) {
+      if (key === 'command') continue; // handled explicitly below
+      if (typeof value === 'string') {
+        scanExecutableText(ctx, `${location} with.${key}`, value, 0);
+      }
+    }
+
+    if (uses.startsWith('cloudflare/wrangler-action')) {
+      const rawCommand = (withInputs as any).command;
+      if (rawCommand === undefined) {
+        // The action's default command is `deploy`, so an omitted command is
+        // still a mutating deploy.
+        scanExecutableText(ctx, `${location} wrangler-action command`, 'wrangler deploy', 0);
+      } else if (typeof rawCommand !== 'string') {
+        // A sequence/other type would join into a command we can't reason about.
+        addViolation(ctx, `${location} wrangler-action command`, 'unauditable-command', `wrangler-action command is not a plain string — failing closed`);
+        ctx.mutations.push({ kind: 'wrangler (unauditable command)', segment: JSON.stringify(rawCommand), pages: false });
+      } else {
+        // An expression in the SUBCOMMAND position could resolve to any wrangler
+        // subcommand (e.g. `command: ${{ vars.WRANGLER_COMMAND }}`) and escapes
+        // static analysis. An expression in an argument position (e.g. the
+        // `--name ${{ vars.WORKER_NAME }}` value) is fine — it is passed as a
+        // single arg and WORKER_NAME is checked at deploy time.
+        const firstToken = rawCommand.trimStart().split(/\s+/)[0] ?? '';
+        if (firstToken.includes('${{')) {
+          addViolation(ctx, `${location} wrangler-action command`, 'unauditable-command', `wrangler-action subcommand is a GitHub expression that could resolve to anything at runtime: ${rawCommand}`);
+        }
+        scanExecutableText(ctx, `${location} wrangler-action command`, `wrangler ${rawCommand}`, 0);
+      }
+    }
   }
-  ctx.externalActions.push({ location, uses });
-  if (uses.startsWith('cloudflare/wrangler-action')) {
-    // The action's default command is `deploy`, so an omitted command is
-    // still a mutating deploy.
-    const command = typeof step?.with?.command === 'string' ? step.with.command : 'deploy';
-    scanExecutableText(ctx, `${location} wrangler-action command`, `wrangler ${command}`, 0);
-  }
+  ctx.currentStepHasCfCreds = previousCredState;
 }
 
 export function auditWorkflowText(text: string, name: string, options: AuditOptions): Violation[] {
@@ -479,6 +586,8 @@ export function auditWorkflowText(text: string, name: string, options: AuditOpti
     violations: [],
     mutations: [],
     deployScopedHits: [],
+    jobExecCandidates: [],
+    currentStepHasCfCreds: false,
     externalActions: [],
     visitedScripts: new Set(),
     visitedFiles: new Set(),
@@ -506,6 +615,13 @@ export function auditWorkflowText(text: string, name: string, options: AuditOpti
   for (const [jobId, jobRaw] of Object.entries(jobs as Record<string, unknown>)) {
     const job: any = jobRaw;
     const mutationsBefore = ctx.mutations.length;
+    // Per-job memo: a script or composite action reused across jobs must be
+    // re-evaluated in each job so a mutation in a later, ungated job is not
+    // silently dropped as "already visited".
+    ctx.visitedScripts = new Set();
+    ctx.visitedFiles = new Set();
+    ctx.jobExecCandidates = [];
+    ctx.currentStepHasCfCreds = hasCloudflareCredentials(job?.env);
     scanEnvValues(ctx, `job "${jobId}"`, job?.env);
 
     if (typeof job?.uses === 'string') {
@@ -539,13 +655,26 @@ export function auditWorkflowText(text: string, name: string, options: AuditOpti
 
     const jobMutations = ctx.mutations.slice(mutationsBefore);
     if (jobMutations.length > 0) {
+      // A credentialed deploy job may not run unauditable script files.
+      ctx.violations.push(...ctx.jobExecCandidates);
+
       const jobIf = typeof job?.if === 'string' ? job.if : '';
+      // Require the gate as a plain conjunct: reject if it is absent, or if
+      // the `if` weakens it with disjunction/negation (`|| dispatch`, `!(…)`),
+      // which would let an unguarded trigger through.
       if (!jobIf.includes(GATE_EXPRESSION)) {
         addViolation(
           ctx,
           `job "${jobId}"`,
           'ungated-mutation',
           `job runs ${jobMutations.map((m) => m.kind).join(', ')} without job-level "${GATE_EXPRESSION}" gate (push and workflow_dispatch would both be unguarded)`,
+        );
+      } else if (/\|\||(?<![!=<>])!(?!=)/.test(jobIf)) {
+        addViolation(
+          ctx,
+          `job "${jobId}"`,
+          'weakened-gate',
+          `job "if" weakens the deploy gate with a disjunction/negation — the gate must be a plain conjunct: ${jobIf}`,
         );
       }
       for (const mutation of jobMutations) {

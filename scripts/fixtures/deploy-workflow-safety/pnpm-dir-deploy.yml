@@ -1,0 +1,7 @@
+name: Fixture pnpm -C dir deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm -C apps/worker deploy

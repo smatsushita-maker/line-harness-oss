@@ -1,0 +1,10 @@
+name: Fixture disjunction-weakened gate
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  deploy:
+    if: vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx wrangler deploy --name my-worker

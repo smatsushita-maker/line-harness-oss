@@ -1,0 +1,12 @@
+name: Fixture wrangler-action preCommands d1
+on: push
+jobs:
+  deploy:
+    if: github.repository != 'Shudesu/line-harness-oss' && vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          preCommands: npx wrangler d1 migrations apply prod --remote
+          command: deploy --name my-worker

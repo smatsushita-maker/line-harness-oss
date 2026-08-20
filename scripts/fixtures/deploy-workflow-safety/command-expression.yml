@@ -1,0 +1,10 @@
+name: Fixture wrangler-action command expression
+on: push
+jobs:
+  deploy:
+    if: github.repository != 'Shudesu/line-harness-oss' && vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          command: ${{ vars.WRANGLER_COMMAND }}

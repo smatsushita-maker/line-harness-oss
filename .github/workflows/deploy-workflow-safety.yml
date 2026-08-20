@@ -8,8 +8,10 @@ name: Deploy Workflow Safety
 
 on:
   pull_request:
+  # No branch filter: a push to ANY branch that modifies a deploy workflow is
+  # audited, so a branch-push + workflow_dispatch cannot reach an unaudited
+  # deploy workflow.
   push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

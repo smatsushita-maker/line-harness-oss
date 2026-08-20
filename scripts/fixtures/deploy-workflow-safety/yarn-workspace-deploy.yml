@@ -1,0 +1,7 @@
+name: Fixture yarn workspace deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: yarn workspace worker deploy

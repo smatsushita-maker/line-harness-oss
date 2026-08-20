@@ -1,0 +1,7 @@
+name: Fixture quoted d1 evasion
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx wrangler "d1" execute prod --remote --command "DELETE FROM friends"

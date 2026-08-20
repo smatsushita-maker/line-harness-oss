@@ -63,6 +63,24 @@ describe('live workflows', () => {
     expect(deployIndex).toBeGreaterThan(auditIndex);
   });
 
+  it('the deploy workflow does not let its audit step soft-fail via continue-on-error', () => {
+    const doc = parse(readFileSync(deployWorkflowPath, 'utf8'));
+    const steps: any[] = doc.jobs.deploy.steps;
+    const auditStep = steps.find(
+      (s) => typeof s.run === 'string' && s.run.includes('deploy-workflow-safety.ts'),
+    );
+    expect(auditStep).toBeDefined();
+    expect(auditStep['continue-on-error']).toBeUndefined();
+  });
+
+  it('the deploy CI backstop has no branch filter on push (branch pushes are audited)', () => {
+    const safetyWorkflow = path.join(repoRoot, '.github', 'workflows', 'deploy-workflow-safety.yml');
+    const on = parse(readFileSync(safetyWorkflow, 'utf8')).on;
+    // `push:` present but with no `branches:` narrowing.
+    expect('push' in on).toBe(true);
+    expect(on.push == null || on.push.branches == null).toBe(true);
+  });
+
   it('flags the deploy workflow if its gate is ever removed (regression control)', () => {
     const text = readFileSync(deployWorkflowPath, 'utf8');
     const ungated = text
@@ -111,12 +129,67 @@ describe('negative controls — DB mutation paths must FAIL', () => {
     expect(rules(auditFixture('external-reusable.yml'))).toContain('external-reusable-workflow');
   });
 
-  it('npm run of a nonexistent script fails closed', () => {
-    expect(rules(auditFixture('npm-run-unknown.yml'))).toContain('unresolvable-script');
+  it('an unresolvable --filter (missing package) fails closed', () => {
+    const violations = auditWorkflowText(
+      [
+        'name: x',
+        'on: push',
+        'jobs:',
+        '  bad:',
+        '    runs-on: ubuntu-latest',
+        '    steps:',
+        '      - run: pnpm --filter no-such-package deploy',
+      ].join('\n'),
+      'missing-filter.yml',
+      { repoRoot },
+    );
+    expect(rules(violations)).toContain('unresolvable-script');
   });
 
   it('unparseable YAML fails closed', () => {
     expect(rules(auditFixture('malformed.yml'))).toContain('parse-failure');
+  });
+
+  it.each([
+    ['precommands.yml', 'wrangler-action preCommands running d1'],
+    ['github-script-d1.yml', 'github-script with.script hitting the D1 REST API'],
+  ])('%s (%s) is rejected as db-mutation', (fixture) => {
+    expect(rules(auditFixture(fixture))).toContain('db-mutation');
+  });
+
+  it.each([
+    ['quoted-d1.yml', 'wrangler "d1" execute'],
+    ['ifs-d1.yml', 'npx${IFS}wrangler${IFS}d1${IFS}execute'],
+  ])('%s defeats shell-quoting evasion and is caught', (fixture) => {
+    expect(rules(auditFixture(fixture))).toContain('db-mutation');
+  });
+
+  it.each([
+    ['pnpm-dir-deploy.yml', 'pnpm -C apps/worker deploy'],
+    ['npx-pnpm-deploy.yml', 'npx pnpm --filter worker deploy'],
+    ['yarn-workspace-deploy.yml', 'yarn workspace worker deploy'],
+  ])('%s (%s) resolves to an ungated wrangler deploy', (fixture) => {
+    expect(rules(auditFixture(fixture))).toContain('ungated-mutation');
+  });
+
+  it('a gate weakened by disjunction is rejected', () => {
+    expect(rules(auditFixture('gate-disjunction.yml'))).toContain('weakened-gate');
+  });
+
+  it('a mutation in a second, ungated job is not memoized away', () => {
+    expect(rules(auditFixture('cross-job-memo.yml'))).toContain('ungated-mutation');
+  });
+
+  it('an unauditable script file in a credentialed deploy job fails closed', () => {
+    expect(rules(auditFixture('script-file-exec.yml'))).toContain('unauditable-exec');
+  });
+
+  it('pipe-to-shell is rejected as dynamic exec', () => {
+    expect(rules(auditFixture('pipe-to-shell.yml'))).toContain('dynamic-exec');
+  });
+
+  it('a wrangler-action subcommand supplied by a GitHub expression fails closed', () => {
+    expect(rules(auditFixture('command-expression.yml'))).toContain('unauditable-command');
   });
 
   it('resolves innocuous-looking package scripts to their real commands', () => {
