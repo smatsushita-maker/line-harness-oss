@@ -1,0 +1,5 @@
+name: Fixture external reusable workflow
+on: push
+jobs:
+  deploy:
+    uses: octo-org/example/.github/workflows/deploy.yml@main

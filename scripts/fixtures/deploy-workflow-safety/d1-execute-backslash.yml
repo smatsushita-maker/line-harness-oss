@@ -1,0 +1,10 @@
+name: Fixture d1 execute via line continuation
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          npx wrangler \
+            d1 \
+            execute prod-db --remote --command "SELECT 1"

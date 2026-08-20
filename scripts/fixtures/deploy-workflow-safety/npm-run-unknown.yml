@@ -1,0 +1,7 @@
+name: Fixture unknown npm script
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run definitely-not-a-real-script

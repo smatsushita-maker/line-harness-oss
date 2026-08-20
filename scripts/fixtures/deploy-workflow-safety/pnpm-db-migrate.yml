@@ -1,0 +1,7 @@
+name: Fixture pnpm db:migrate
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm db:migrate

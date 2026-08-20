@@ -27,6 +27,7 @@
     "deploy:update": "node packages/create-line-harness/dist/index.js update",
     "sandbox:create-line-harness": "bash scripts/run-create-line-harness-sandbox.sh",
     "test:scripts": "vitest run --config vitest.config.ts",
+    "test:deploy-safety": "vitest run --config vitest.config.ts scripts/deploy-workflow-safety.test.ts",
     "build:bundle": "tsx scripts/release/build-bundle.ts"
   },
   "packageManager": "pnpm@9.15.4",
@@ -34,9 +35,10 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "typescript": "^5.9.3",
-    "wrangler": "4",
     "tsx": "^4.21.0",
-    "vitest": "^2.1.0"
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.0",
+    "wrangler": "4",
+    "yaml": "^2.9.0"
   }
 }

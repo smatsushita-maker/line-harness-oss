@@ -1,0 +1,7 @@
+name: Fixture composite action indirection
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./scripts/fixtures/deploy-workflow-safety/hidden-action

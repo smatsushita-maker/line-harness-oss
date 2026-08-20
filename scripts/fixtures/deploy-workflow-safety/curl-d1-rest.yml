@@ -1,0 +1,10 @@
+name: Fixture Cloudflare D1 REST
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/d1/database/$DB/query" \
+            -H "Authorization: Bearer $TOKEN" \
+            -d '{"sql":"DELETE FROM friends"}'
