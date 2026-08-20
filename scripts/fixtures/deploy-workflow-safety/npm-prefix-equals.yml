@@ -1,0 +1,7 @@
+name: Fixture npm --prefix= run deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm --prefix=apps/worker run deploy

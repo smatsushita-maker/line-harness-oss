@@ -39,6 +39,20 @@ Edit can still deploy Worker *code* that writes to D1 at runtime through its
 binding. The protection is layered — workflow audit + PR review + the deploy
 gate + keeping migrations out of the deploy path entirely.
 
+### Auditor limitations (why the token boundary is the backstop)
+
+The static auditor raises the bar; it is not a complete sandbox. Known
+residuals, all mitigated by the token lacking D1 Edit and by human review:
+
+- A credential smuggled through `$GITHUB_ENV` from a prior step can reach a
+  later script-file step whose own `env` names no secret.
+- A GitHub *variable* (repo admin only) interpolated into a wrangler-action
+  `command` argument position is not statically checkable.
+- With no branch protection on the repo, a single PR could delete both the
+  in-workflow audit step and the `Deploy Workflow Safety` CI workflow while
+  re-introducing a D1 step. Recommended: a `main` ruleset requiring the
+  `audit` check plus CODEOWNERS review on `.github/**`.
+
 ## Configuration checklist (GitHub → Settings → Secrets and variables → Actions)
 
 Secrets: `CLOUDFLARE_API_TOKEN` (scoped as above), `CLOUDFLARE_ACCOUNT_ID`,

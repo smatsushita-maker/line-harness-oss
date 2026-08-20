@@ -160,16 +160,26 @@ describe('negative controls — DB mutation paths must FAIL', () => {
   it.each([
     ['quoted-d1.yml', 'wrangler "d1" execute'],
     ['ifs-d1.yml', 'npx${IFS}wrangler${IFS}d1${IFS}execute'],
+    ['ifs-variant-d1.yml', 'wrangler${IFS%??}d1${IFS%??}execute'],
   ])('%s defeats shell-quoting evasion and is caught', (fixture) => {
     expect(rules(auditFixture(fixture))).toContain('db-mutation');
   });
 
   it.each([
     ['pnpm-dir-deploy.yml', 'pnpm -C apps/worker deploy'],
+    ['pnpm-dir-equals.yml', 'pnpm --dir=apps/worker deploy'],
+    ['pnpm-c-attached.yml', 'pnpm -Capps/worker deploy'],
     ['npx-pnpm-deploy.yml', 'npx pnpm --filter worker deploy'],
+    ['corepack-deploy.yml', 'corepack pnpm --filter worker deploy'],
     ['yarn-workspace-deploy.yml', 'yarn workspace worker deploy'],
+    ['yarn-foreach-deploy.yml', 'yarn workspaces foreach run deploy'],
+    ['npm-prefix-equals.yml', 'npm --prefix=apps/worker run deploy'],
   ])('%s (%s) resolves to an ungated wrangler deploy', (fixture) => {
     expect(rules(auditFixture(fixture))).toContain('ungated-mutation');
+  });
+
+  it('mutually-referencing reusable workflows do not crash the auditor', () => {
+    expect(() => auditFixture('reusable-cycle-a.yml')).not.toThrow();
   });
 
   it('a gate weakened by disjunction is rejected', () => {

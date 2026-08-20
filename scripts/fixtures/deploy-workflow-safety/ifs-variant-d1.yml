@@ -1,0 +1,7 @@
+name: Fixture IFS parameter-expansion evasion
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: wrangler${IFS%??}d1${IFS%??}execute${IFS%??}prod --remote

@@ -69,6 +69,8 @@ export interface AuditOptions {
   repoRoot: string;
   /** Override workspace package discovery (used by tests). */
   packages?: PackageInfo[];
+  /** Internal: reusable workflows already entered, to break `uses:` cycles. */
+  _visitedWorkflows?: Set<string>;
 }
 
 export const GATE_EXPRESSION = "vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true'";
@@ -161,12 +163,18 @@ interface ScanContext {
   visitedFiles: Set<string>;
 }
 
-/** Does this env block put Cloudflare deploy credentials in scope? */
+/**
+ * Does this env/with block put deploy-sensitive credentials in scope? Matches
+ * Cloudflare-ish names AND any value that references a repository secret, so a
+ * renamed secret (`TOKEN: ${{ secrets.DEPLOY_KEY }}`) is still detected. (A
+ * token smuggled through $GITHUB_ENV from a prior step is a documented
+ * residual — the deploy token's lack of D1 Edit is the backstop there.)
+ */
 function hasCloudflareCredentials(env: unknown): boolean {
   if (!env || typeof env !== 'object') return false;
   for (const [name, raw] of Object.entries(env as Record<string, unknown>)) {
     if (/CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID|CF_API_TOKEN|WRANGLER/i.test(name)) return true;
-    if (/secrets\.(?:CLOUDFLARE|CF_|WRANGLER)/i.test(String(raw ?? ''))) return true;
+    if (/secrets\./i.test(String(raw ?? ''))) return true;
   }
   return false;
 }
@@ -180,7 +188,11 @@ function hasCloudflareCredentials(env: unknown): boolean {
  */
 export function normalizeSegment(segment: string): string {
   return segment
-    .replace(/\$\{IFS\}/g, ' ')
+    // `${IFS}`, `${IFS%??}`, `${IFS:0:1}`, bare `$IFS` — all expand to a
+    // separator at runtime; collapse them so word-splitting cannot hide a
+    // banned token (`wrangler${IFS%??}d1`).
+    .replace(/\$\{IFS[^}]*\}/g, ' ')
+    .replace(/\$IFS\b/g, ' ')
     .replace(/['"`]/g, '')
     .replace(/\\(?=\S)/g, '');
 }
@@ -324,9 +336,9 @@ function resolvePackageManagerInvocation(
   depth: number,
 ): void {
   let tokens = stripEnvAssignments(normalizeSegment(segment).split(/\s+/).filter(Boolean));
-  // Strip a leading `npx`/`pnpm dlx` shim (with its own no-value flags) so
-  // `npx pnpm --filter worker deploy` resolves like `pnpm ...`.
-  if (tokens[0] === 'npx') {
+  // Strip a leading `npx`/`corepack` shim (with its own no-value flags) so
+  // `npx pnpm …` / `corepack pnpm …` resolve like `pnpm …`.
+  while (tokens[0] === 'npx' || tokens[0] === 'corepack') {
     let j = 1;
     while (j < tokens.length && tokens[j].startsWith('-')) {
       if (tokens[j] === '-p' || tokens[j] === '--package') j += 2;
@@ -346,12 +358,18 @@ function resolvePackageManagerInvocation(
   let sawRunKeyword = false;
   let script: string | undefined;
 
-  // `yarn workspace <pkg> <script>` selects a package by name.
+  // `yarn workspace <pkg> <script>` selects one package; `yarn workspaces
+  // foreach … run <script>` runs it across every package (like `-r`).
   if (tool === 'yarn' && tokens[1] === 'workspace') {
     filters.push(tokens[2] ?? '');
     i = 3;
     sawRunKeyword = true;
+  } else if (tool === 'yarn' && tokens[1] === 'workspaces' && tokens[2] === 'foreach') {
+    recursive = true;
+    i = 3;
   }
+
+  const selectorFlag = (name: string) => name === '--dir' || name === '-C' || name === '--prefix';
 
   while (i < tokens.length) {
     const token = tokens[i];
@@ -360,15 +378,26 @@ function resolvePackageManagerInvocation(
       i += 2;
       continue;
     }
-    if (token.startsWith('--filter=')) {
-      filters.push(token.slice('--filter='.length));
+    if (token.startsWith('--filter=') || token.startsWith('-F=')) {
+      filters.push(token.slice(token.indexOf('=') + 1));
       i += 1;
       continue;
     }
-    if (token === '--dir' || token === '-C' || token === '--prefix') {
-      // Working-directory selector — pnpm runs the script in that package.
+    if (selectorFlag(token)) {
+      // Working-directory selector (space form) — pnpm runs the script there.
       dirSelectors.push(tokens[i + 1] ?? '');
       i += 2;
+      continue;
+    }
+    if (token.startsWith('--dir=') || token.startsWith('--prefix=') || token.startsWith('-C=')) {
+      dirSelectors.push(token.slice(token.indexOf('=') + 1));
+      i += 1;
+      continue;
+    }
+    if (token.startsWith('-C') && token.length > 2) {
+      // Attached form `-Capps/worker`.
+      dirSelectors.push(token.slice(2));
+      i += 1;
       continue;
     }
     if (token === '-r' || token === '--recursive') {
@@ -627,8 +656,11 @@ export function auditWorkflowText(text: string, name: string, options: AuditOpti
     if (typeof job?.uses === 'string') {
       if (job.uses.startsWith('./')) {
         const reusablePath = path.join(options.repoRoot, job.uses.split('@')[0]);
-        if (ctx.visitedFiles.has(reusablePath)) continue;
-        ctx.visitedFiles.add(reusablePath);
+        // Cross-invocation cycle guard: nested audits get a fresh ctx, so the
+        // visited set must live on options to break `uses:` cycles.
+        const visitedWorkflows = (options._visitedWorkflows ??= new Set<string>());
+        if (visitedWorkflows.has(reusablePath)) continue;
+        visitedWorkflows.add(reusablePath);
         if (!existsSync(reusablePath)) {
           addViolation(ctx, `job "${jobId}"`, 'unresolvable-action', `local reusable workflow "${job.uses}" not found — failing closed`);
         } else {
