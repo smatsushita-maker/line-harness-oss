@@ -346,20 +346,21 @@ function resolvePackageManagerInvocation(
   // `npx`/`corepack` shim) whose bare name is pnpm/npm/yarn. A path-qualified
   // launcher may appear at any position (e.g. after a `$(…)` substitution).
   let start = 0;
-  while (tokens[start] === 'npx' || tokens[start] === 'corepack') {
+  while (tokens[start] === 'npx' || tokens[start] === 'corepack' || tokens[start] === 'bunx') {
     start += 1;
     while (start < tokens.length && tokens[start].startsWith('-')) {
       start += tokens[start] === '-p' || tokens[start] === '--package' ? 2 : 1;
     }
   }
-  // Scan for the first pnpm/npm/yarn launcher token. No position/slash guard:
-  // command wrappers (`env`, `exec`, `time`, `sudo`, `nice`, `command`,
-  // `xargs`, `stdbuf …`) and flag-values can sit before it, and treating a
-  // stray bare token as a launcher is fail-safe (it resolves nothing).
+  // Scan for the first workspace-runner launcher token (pnpm/npm/yarn/bun).
+  // No position/slash guard: command wrappers (`env`, `exec`, `time`, `sudo`,
+  // `nice`, `command`, `xargs`, `stdbuf …`) and flag-values can sit before it,
+  // and treating a stray bare token as a launcher is fail-safe (it resolves
+  // nothing).
+  const LAUNCHERS = new Set(['pnpm', 'npm', 'yarn', 'bun']);
   let launcherIdx = -1;
   for (let k = start; k < tokens.length; k++) {
-    const name = launcherName(tokens[k]);
-    if (name === 'pnpm' || name === 'npm' || name === 'yarn') {
+    if (LAUNCHERS.has(launcherName(tokens[k]))) {
       launcherIdx = k;
       break;
     }

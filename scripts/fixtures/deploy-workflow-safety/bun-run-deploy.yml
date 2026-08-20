@@ -1,0 +1,7 @@
+name: Fixture bun run deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bun run --filter worker deploy
