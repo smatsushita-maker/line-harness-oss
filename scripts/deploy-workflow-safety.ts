@@ -400,6 +400,17 @@ function resolvePackageManagerInvocation(
       i += 1;
       continue;
     }
+    if (token === '-w' || token === '--workspace') {
+      // npm workspace selector — value is a package name or a path.
+      filters.push(tokens[i + 1] ?? '');
+      i += 2;
+      continue;
+    }
+    if (token.startsWith('-w=') || token.startsWith('--workspace=')) {
+      filters.push(token.slice(token.indexOf('=') + 1));
+      i += 1;
+      continue;
+    }
     if (token === '-r' || token === '--recursive') {
       recursive = true;
       i += 1;
@@ -442,10 +453,15 @@ function resolvePackageManagerInvocation(
 
   if (selectors.length > 0) {
     for (const sel of selectors) {
-      const target = packages.find((p) =>
-        sel.kind === 'filter'
-          ? p.name === sel.value || path.basename(p.dir) === sel.value
-          : path.normalize(p.dir) === path.normalize(sel.value) || path.basename(p.dir) === sel.value,
+      // A selector value can be a package name, a bare dir name, or a path
+      // (`apps/worker`, `./apps/worker`) — try all so npm `-w <path>` and
+      // `--filter=./apps/worker` resolve the same package.
+      const norm = (v: string) => path.normalize(v.replace(/^\.\//, ''));
+      const target = packages.find(
+        (p) =>
+          p.name === sel.value ||
+          path.basename(p.dir) === sel.value ||
+          norm(p.dir) === norm(sel.value),
       );
       if (!target) {
         addViolation(

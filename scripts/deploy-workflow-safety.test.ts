@@ -174,6 +174,8 @@ describe('negative controls — DB mutation paths must FAIL', () => {
     ['yarn-workspace-deploy.yml', 'yarn workspace worker deploy'],
     ['yarn-foreach-deploy.yml', 'yarn workspaces foreach run deploy'],
     ['npm-prefix-equals.yml', 'npm --prefix=apps/worker run deploy'],
+    ['npm-workspace-deploy.yml', 'npm -w apps/worker run deploy'],
+    ['pnpm-filter-path-deploy.yml', 'pnpm --filter=./apps/worker deploy'],
   ])('%s (%s) resolves to an ungated wrangler deploy', (fixture) => {
     expect(rules(auditFixture(fixture))).toContain('ungated-mutation');
   });
