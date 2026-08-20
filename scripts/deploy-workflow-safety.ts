@@ -352,10 +352,14 @@ function resolvePackageManagerInvocation(
       start += tokens[start] === '-p' || tokens[start] === '--package' ? 2 : 1;
     }
   }
+  // Scan for the first pnpm/npm/yarn launcher token. No position/slash guard:
+  // command wrappers (`env`, `exec`, `time`, `sudo`, `nice`, `command`,
+  // `xargs`, `stdbuf …`) and flag-values can sit before it, and treating a
+  // stray bare token as a launcher is fail-safe (it resolves nothing).
   let launcherIdx = -1;
   for (let k = start; k < tokens.length; k++) {
     const name = launcherName(tokens[k]);
-    if ((name === 'pnpm' || name === 'npm' || name === 'yarn') && (k === start || tokens[k].includes('/'))) {
+    if (name === 'pnpm' || name === 'npm' || name === 'yarn') {
       launcherIdx = k;
       break;
     }

@@ -178,6 +178,9 @@ describe('negative controls — DB mutation paths must FAIL', () => {
     ['pnpm-filter-path-deploy.yml', 'pnpm --filter=./apps/worker deploy'],
     ['bin-path-deploy.yml', './node_modules/.bin/pnpm --filter worker deploy'],
     ['bin-subst-deploy.yml', '$(npm bin)/pnpm --filter worker deploy'],
+    ['wrapper-env-deploy.yml', 'env pnpm --filter worker deploy'],
+    ['wrapper-time-deploy.yml', 'time pnpm --filter worker deploy'],
+    ['wrapper-envassign-deploy.yml', 'env FOO=bar pnpm --filter worker deploy'],
   ])('%s (%s) resolves to an ungated wrangler deploy', (fixture) => {
     expect(rules(auditFixture(fixture))).toContain('ungated-mutation');
   });

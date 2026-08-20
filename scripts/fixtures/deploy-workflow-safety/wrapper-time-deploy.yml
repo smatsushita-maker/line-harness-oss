@@ -1,0 +1,7 @@
+name: Fixture time wrapper deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: time pnpm --filter worker deploy
