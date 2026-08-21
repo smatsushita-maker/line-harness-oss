@@ -35,6 +35,7 @@ export * from './affiliate-attribution';
 export * from './affiliate-report';
 export * from './account-settings';
 export * from './webinars';
+export * from './admin-sso';
 
 /**
  * Thin wrapper around D1Database.
