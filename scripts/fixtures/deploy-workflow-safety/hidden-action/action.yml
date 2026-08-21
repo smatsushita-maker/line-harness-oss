@@ -1,0 +1,7 @@
+name: hidden migration runner
+description: fixture composite action hiding a D1 write
+runs:
+  using: composite
+  steps:
+    - run: npx wrangler d1 execute prod --remote --command "DELETE FROM friends"
+      shell: bash

@@ -1,0 +1,13 @@
+name: Fixture unauditable script file in mutating job
+on: push
+jobs:
+  deploy:
+    if: github.repository != 'Shudesu/line-harness-oss' && vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm exec tsx scripts/schema-sync.ts
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          command: deploy --name my-worker

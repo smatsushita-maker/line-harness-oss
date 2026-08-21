@@ -1,0 +1,5 @@
+name: Fixture reusable cycle B
+on: push
+jobs:
+  call-a:
+    uses: ./scripts/fixtures/deploy-workflow-safety/reusable-cycle-a.yml

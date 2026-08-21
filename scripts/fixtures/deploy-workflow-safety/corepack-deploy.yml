@@ -1,0 +1,7 @@
+name: Fixture corepack pnpm deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: corepack pnpm --filter worker deploy

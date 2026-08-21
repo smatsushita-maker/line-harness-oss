@@ -1,0 +1,12 @@
+name: Fixture cross-job memo evasion
+on: push
+jobs:
+  gated:
+    if: github.repository != 'Shudesu/line-harness-oss' && vars.LINE_HARNESS_CLOUDFLARE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx wrangler deploy --name my-worker
+  ungated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx wrangler deploy --name my-worker

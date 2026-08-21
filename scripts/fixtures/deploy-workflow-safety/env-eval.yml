@@ -1,0 +1,9 @@
+name: Fixture env plus eval
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    env:
+      CMD: wrangler d1 execute prod --remote --command "DROP TABLE friends"
+    steps:
+      - run: eval "$CMD"

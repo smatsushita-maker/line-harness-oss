@@ -1,0 +1,7 @@
+name: Fixture env with assignment wrapper deploy
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: env FOO=bar pnpm --filter worker deploy

@@ -1,0 +1,10 @@
+name: Fixture github-script D1 REST
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await fetch('https://api.cloudflare.com/client/v4/accounts/x/d1/database/y/query', { method: 'POST' })

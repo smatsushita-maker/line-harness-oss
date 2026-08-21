@@ -1,0 +1,34 @@
+name: Deploy Workflow Safety
+
+# Independent CI backstop for scripts/deploy-workflow-safety.ts: verifies
+# that no workflow can mutate the production D1 database and that every
+# Cloudflare-mutating job stays behind the LINE_HARNESS_CLOUDFLARE_DEPLOY
+# gate. Deliberately has NO paths filter — a PR that edits a deploy
+# workflow (or deletes its in-workflow audit step) is still checked here.
+
+on:
+  pull_request:
+  # No branch filter: a push to ANY branch that modifies a deploy workflow is
+  # audited, so a branch-push + workflow_dispatch cannot reach an unaudited
+  # deploy workflow.
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:deploy-safety

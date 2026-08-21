@@ -1,0 +1,7 @@
+"name": Fixture quoted keys
+"on": push
+"jobs":
+  "bad":
+    "runs-on": ubuntu-latest
+    "steps":
+      - "run": npx wrangler d1 execute prod --remote --command "SELECT 1"

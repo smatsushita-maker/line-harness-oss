@@ -1,0 +1,7 @@
+name: Fixture npm run db:migrate
+on: push
+jobs:
+  bad:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run db:migrate
