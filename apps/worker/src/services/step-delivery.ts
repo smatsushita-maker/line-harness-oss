@@ -18,6 +18,7 @@ import {
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { jitterDeliveryTime, addJitter, sleep } from './stealth.js';
+import { getQuotaUsage, quotaEnabled, type QuotaEnv } from './quota.js';
 
 /**
  * Replace template variables in message content.
@@ -118,6 +119,7 @@ export async function processStepDeliveries(
   db: D1Database,
   lineClient: LineClient,
   workerUrl?: string,
+  quotaEnv?: QuotaEnv,
 ): Promise<void> {
   // Crash recovery: a claim (active→delivering) that never got released means
   // the worker died mid-delivery — without this, the enrollment is stranded
@@ -129,13 +131,29 @@ export async function processStepDeliveries(
     console.warn(`[step-delivery] recovered ${recovered} stuck 'delivering' enrollment(s)`);
   }
 
+  // Enrollments stay untouched; the next tick re-evaluates once under quota.
+  // While a monthly limit is configured, this tick's sends are additionally
+  // capped to the remaining budget (max - used), computed once up front — no
+  // per-send re-query. Without that cap a tick could overshoot the limit by
+  // up to MAX_SENDS_PER_CRON deliveries. A friends-only limit keeps the
+  // previous behavior (block when exceeded, otherwise the full batch size).
+  let sendBudget = MAX_SENDS_PER_CRON;
+  if (quotaEnv && quotaEnabled(quotaEnv)) {
+    const usage = await getQuotaUsage(db, quotaEnv);
+    if (usage.exceeded) return;
+    if (usage.monthlyMessages.max > 0) {
+      sendBudget = Math.min(sendBudget, usage.monthlyMessages.max - usage.monthlyMessages.used);
+      if (sendBudget <= 0) return;
+    }
+  }
+
   const now = jstNow();
   const dueFriendScenarios = await getFriendScenariosDueForDelivery(db, now);
 
   let sendCount = 0;
   let attemptCount = 0;
   for (let i = 0; i < dueFriendScenarios.length; i++) {
-    if (sendCount >= MAX_SENDS_PER_CRON || attemptCount >= MAX_ATTEMPTS_PER_CRON) break;
+    if (sendCount >= sendBudget || attemptCount >= MAX_ATTEMPTS_PER_CRON) break;
     const fs = dueFriendScenarios[i];
     attemptCount++;
     try {

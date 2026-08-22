@@ -866,6 +866,11 @@ CREATE TABLE scoring_rules (
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE sso_jti (
+  jti TEXT PRIMARY KEY,
+  exp INTEGER NOT NULL
+);
+
 CREATE TABLE staff (
   id                       TEXT PRIMARY KEY,
   line_account_id          TEXT NOT NULL,
@@ -1350,6 +1355,8 @@ CREATE INDEX idx_rich_menu_pages_group    ON rich_menu_pages(group_id, order_ind
 CREATE INDEX idx_scenario_steps_scenario_id ON scenario_steps (scenario_id);
 
 CREATE INDEX idx_shifts_staff_date ON staff_shifts (staff_id, work_date);
+
+CREATE INDEX idx_sso_jti_exp ON sso_jti(exp);
 
 CREATE INDEX idx_staff_account_sort ON staff (line_account_id, sort_order);
 

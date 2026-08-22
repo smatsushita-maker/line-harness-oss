@@ -41,6 +41,7 @@ export default function StaffShiftsPage() {
   const [serviceAccountEmail, setServiceAccountEmail] = useState<string | null>(null)
   const [serviceAccountConfigured, setServiceAccountConfigured] = useState(false)
   const [oauthConfigured, setOauthConfigured] = useState(false)
+  const [hasSavedWorkingHours, setHasSavedWorkingHours] = useState(true)
   const [loading, setLoading] = useState(true)
   const [savingRules, setSavingRules] = useState(false)
   const [savingCalendar, setSavingCalendar] = useState(false)
@@ -60,6 +61,13 @@ export default function StaffShiftsPage() {
       ])
       setStaffMember(staff.staff.find((item) => item.id === staffId) ?? null)
       setShifts(dated.shifts)
+      // 期限切れの日付別シフトや無効化済みルールだけでは予約枠は生まれない。
+      // availability 計算と同じ「使える受付時間」の定義で警告を判定する。
+      const todayJst = new Date(Date.now() + 9 * 60 * 60_000).toISOString().slice(0, 10)
+      setHasSavedWorkingHours(
+        rules.rules.some((rule) => rule.is_active === 1) ||
+        dated.shifts.some((shift) => shift.work_date >= todayJst),
+      )
       if (rules.rules.length > 0) {
         const next: WeeklyTemplate = {
           sun: null, mon: null, tue: null, wed: null, thu: null, fri: null, sat: null,
@@ -103,6 +111,8 @@ export default function StaffShiftsPage() {
           : []
       })
       await bookingApi.putAvailabilityRules(selectedAccountId, staffId, rules)
+      const todayJst = new Date(Date.now() + 9 * 60 * 60_000).toISOString().slice(0, 10)
+      setHasSavedWorkingHours(rules.length > 0 || shifts.some((shift) => shift.work_date >= todayJst))
       setSuccess('毎週の受付時間を保存しました。今後は期限切れせず、自動で枠が作られます。')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -165,6 +175,12 @@ export default function StaffShiftsPage() {
         <div className="rounded-lg border border-gray-200 bg-white p-12 text-center text-sm text-gray-500">読み込み中…</div>
       ) : (
         <div className="space-y-4">
+          {!hasSavedWorkingHours && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+              <span className="font-semibold">受付時間がまだ保存されていません。</span>
+              下の内容を確認して「受付時間を保存」を押すまで、このスタッフの予約枠は一切表示されません。
+            </div>
+          )}
           <section className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
             <div className="border-b border-gray-200 bg-gray-50 px-5 py-4">
               <h2 className="font-semibold text-gray-900">毎週の受付時間</h2>

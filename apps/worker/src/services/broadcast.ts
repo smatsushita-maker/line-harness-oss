@@ -21,6 +21,15 @@ import {
   renderBroadcastMessageContent,
 } from './render-message.js';
 import { createBroadcastRetryKey } from './broadcast-retry-key.js';
+import {
+  isQuotaExceeded,
+  quotaEnabled,
+  getQuotaUsage,
+  estimateSendAudience,
+  personalizedAudienceCount,
+  wouldExceedMonthlyQuota,
+  type QuotaEnv,
+} from './quota.js';
 
 const MULTICAST_BATCH_SIZE = 500;
 const PERSONALIZED_PUSH_BATCH_SIZE = 10;
@@ -142,6 +151,27 @@ export async function processBroadcastSend(
 
   try {
     if (broadcast.target_type === 'all') {
+      // LINE's broadcast API does not report a recipient count and writes no
+      // per-recipient messages_log rows. Record the known follower count so
+      // monthly usage tallies (services/quota.ts) can include these sends.
+      // The COUNT runs BEFORE the broadcast call: it is a snapshot taken just
+      // ahead of the send, and a failing D1 read here aborts with nothing
+      // sent. After LINE accepts the broadcast a failure would reset the row
+      // to draft and a retry would re-send to everyone — so no D1 read may
+      // sit between acceptance and the status update that can be avoided.
+      // Legacy friends rows may have a NULL line_account_id yet still follow
+      // (and receive) this account's broadcast, so include them. In
+      // multi-account setups a NULL row can thus be counted toward more than
+      // one account's send — over-counting is the safe direction for a
+      // limiting feature (never lets a send slip under the limit uncounted).
+      const followerRow = broadcastAccountId
+        ? await db
+            .prepare('SELECT COUNT(*) as count FROM friends WHERE is_following = 1 AND (line_account_id = ? OR line_account_id IS NULL)')
+            .bind(broadcastAccountId)
+            .first<{ count: number }>()
+        : await db
+            .prepare('SELECT COUNT(*) as count FROM friends WHERE is_following = 1')
+            .first<{ count: number }>();
       // Use LINE broadcast API (sends to all followers)
       const retryKey = await createBroadcastRetryKey(
         broadcast.id,
@@ -151,9 +181,8 @@ export async function processBroadcastSend(
       );
       const { requestId } = await lineClient.broadcast([message], retryKey);
       await updateBroadcastLineRequestId(db, broadcast.id, requestId, null);
-      // We don't have exact count for broadcast API, set as 0 (unknown)
-      totalCount = 0;
-      successCount = 0;
+      totalCount = followerRow?.count ?? 0;
+      successCount = totalCount;
     } else if (broadcast.target_type === 'tag') {
       if (!broadcast.target_tag_id) {
         throw new Error('target_tag_id is required for tag-targeted broadcasts');
@@ -229,6 +258,7 @@ export async function processScheduledBroadcasts(
   db: D1Database,
   lineClient: LineClient,
   workerUrl?: string,
+  quotaEnv?: QuotaEnv,
 ): Promise<void> {
   const allBroadcasts = await getBroadcasts(db);
 
@@ -241,6 +271,39 @@ export async function processScheduledBroadcasts(
   );
 
   for (const broadcast of scheduled) {
+    // Bulk sends pause while over quota. Re-checked per broadcast (not once
+    // per tick) because an earlier due send in this same loop can cross the
+    // limit. The check runs before the claim, so remaining rows stay
+    // 'scheduled' and are picked up again once back under the limit.
+    if (quotaEnv && quotaEnabled(quotaEnv)) {
+      const usage = await getQuotaUsage(db, quotaEnv);
+      if (usage.exceeded) return;
+      // Same projected-audience refusal as the /send route: a due send whose
+      // estimate would cross the monthly limit is skipped before the claim
+      // (it stays 'scheduled' and is re-evaluated next tick). Dedup targets
+      // have no cheap COUNT (estimateSendAudience → null), so they get the
+      // same preview-based projected total as the /send route — computed only
+      // when a dedup broadcast is actually due, so normal ticks pay nothing
+      // extra. All estimate queries run only while a monthly limit is
+      // configured.
+      if (usage.monthlyMessages.max > 0) {
+        // Each target is estimated against its real send population: dedup
+        // uses the preview projection, personalized sends use their exact
+        // account-filtered audience (same figure as the /send guard — the
+        // generic tag estimate is deliberately unfiltered and would
+        // over-estimate them), and everything else uses the cheap generic
+        // estimate.
+        let estimate: number | null;
+        if (broadcast.target_type === 'multi-account-dedup') {
+          estimate = await (await import('./dedup-broadcast.js')).projectedDedupAudience(db, broadcast);
+        } else if (hasRecipientVariables(broadcast.message_content)) {
+          estimate = await personalizedAudienceCount(db, broadcast);
+        } else {
+          estimate = await estimateSendAudience(db, broadcast);
+        }
+        if (wouldExceedMonthlyQuota(usage, estimate)) continue;
+      }
+    }
     try {
       // Optimistic lock: claim this broadcast (scheduled → sending)
       const lockResult = await db
@@ -283,7 +346,12 @@ export async function processQueuedBroadcasts(
   db: D1Database,
   lineClient: LineClient,
   workerUrl?: string,
+  quotaEnv?: QuotaEnv,
 ): Promise<void> {
+  // NOTE: no blanket quota gate here — the queue must be walked even while
+  // over the limit so rows that only need finalization can complete (see the
+  // pre-claim gate in processQueuedBroadcastBatches). Sends themselves are
+  // stopped per batch inside the executor.
   const queued = await getQueuedBroadcasts(db);
   for (const broadcast of queued) {
     // アカウント別のlineClientを解決
@@ -296,7 +364,7 @@ export async function processQueuedBroadcasts(
     }
 
     try {
-      await processQueuedBroadcastBatches(db, client, broadcast, workerUrl);
+      await processQueuedBroadcastBatches(db, client, broadcast, workerUrl, quotaEnv);
     } catch (err) {
       console.error(`Failed to process queued broadcast ${broadcast.id}:`, err);
     }
@@ -308,10 +376,32 @@ async function processQueuedBroadcastBatches(
   lineClient: LineClient,
   broadcast: import('@line-crm/db').Broadcast,
   workerUrl?: string,
+  quotaEnv?: QuotaEnv,
 ): Promise<void> {
   const raw = broadcast as unknown as Record<string, unknown>;
   const segmentConditionsStr = raw.segment_conditions as string | null;
   const batchOffset = (raw.batch_offset as number) || 0;
+  // dedup は分割送信で毎 tick batch_offset=0 から再入する。継続 tick かどうかは
+  // dedup_progress の有無で判定する (auto-track の一回性判定とクォータの
+  // fresh 判定の両方で使う)。
+  const isDedupContinuation =
+    broadcast.target_type === 'multi-account-dedup' && !!broadcast.dedup_progress;
+
+  // While over quota, only a FRESH row (nothing sent yet, batch_offset 0 and
+  // not a dedup continuation) is skipped — before the claim, so its one-time
+  // side effects (auto-track link creation) are not repeated across ticks
+  // and it simply stays queued. Rows already mid-run proceed: the
+  // between-batch gate below stops further sends, while a row whose
+  // recipients are all sent can still finalize to 'sent' instead of sitting
+  // in 'sending' until the month rolls over.
+  if (
+    quotaEnv
+    && batchOffset === 0
+    && !isDedupContinuation
+    && (await isQuotaExceeded(db, quotaEnv))
+  ) {
+    return;
+  }
 
   // 排他ロック: batch_offset を -1 に設定して他のCronが拾わないようにする
   // WHERE batch_offset = ? で楽観ロック（既に他が処理中なら更新0行→スキップ）
@@ -334,10 +424,9 @@ async function processQueuedBroadcastBatches(
   // 「1 broadcast につき 1 回」に厳密化する。non-dedup は batch_offset が 0→N と進むので
   // `batchOffset === 0` が初回判定になる。dedup は分割送信で毎 tick batch_offset=0 から
   // 再入するため、それだけだと毎 tick auto-track が走って tracked link が二重生成される。
-  // dedup の初回は dedup_progress=NULL なので、その条件を足して継続 tick では再実行しない
-  // (初回に変換結果を message_content へ persist 済みなので、継続 tick はそれを使う)。
-  const isDedupContinuation =
-    broadcast.target_type === 'multi-account-dedup' && !!broadcast.dedup_progress;
+  // dedup の初回は dedup_progress=NULL なので、その条件 (isDedupContinuation) を足して
+  // 継続 tick では再実行しない (初回に変換結果を message_content へ persist 済みなので、
+  // 継続 tick はそれを使う)。
   let finalType: string = broadcast.message_type;
   let finalContent = broadcast.message_content;
   if (workerUrl && batchOffset === 0 && !isDedupContinuation && broadcast.track_links !== 0) {
@@ -375,7 +464,9 @@ async function processQueuedBroadcastBatches(
   if (broadcast.target_type === 'multi-account-dedup') {
     const { processMultiAccountDedupBroadcast } = await import('./dedup-broadcast.js');
     const broadcastForDedup = { ...broadcast, message_type: finalType, message_content: finalContent };
-    const result = await processMultiAccountDedupBroadcast(db, broadcastForDedup);
+    // quotaEnv を渡す: dedup 内部のバッチ境界でも使用量上限を再チェックさせる
+    // (下の while ループの再チェックは dedup 委譲経路では通らないため)。
+    const result = await processMultiAccountDedupBroadcast(db, broadcastForDedup, undefined, { quotaEnv });
     if (!result.complete) {
       // 時間バジェットに達して途中で yield した。status='sending' のまま batch_offset を
       // -1(ロック) → 0 に戻し、次の cron tick が getQueuedBroadcasts で拾って続きを送る。
@@ -423,6 +514,21 @@ async function processQueuedBroadcastBatches(
     }));
   } else {
     // target_type='all' でキューに入ることはないが、念のため
+    // Same follower-count recording as the inline broadcast-API path (the
+    // API reports no recipient count; see services/quota.ts monthly tally).
+    // NULL line_account_id rows are included for the same reason as there,
+    // and the COUNT likewise runs BEFORE the broadcast call: it is a snapshot
+    // taken just ahead of the send, so no avoidable D1 read can fail after
+    // LINE has already accepted the broadcast.
+    const followerRow = accountId
+      ? await db
+          .prepare('SELECT COUNT(*) as count FROM friends WHERE is_following = 1 AND (line_account_id = ? OR line_account_id IS NULL)')
+          .bind(accountId)
+          .first<{ count: number }>()
+      : await db
+          .prepare('SELECT COUNT(*) as count FROM friends WHERE is_following = 1')
+          .first<{ count: number }>();
+    const followerCount = followerRow?.count ?? 0;
     const retryKey = await createBroadcastRetryKey(
       broadcast.id,
       'queued-broadcast',
@@ -432,7 +538,7 @@ async function processQueuedBroadcastBatches(
     const { requestId } = await lineClient.broadcast([message], retryKey);
     await updateBroadcastLineRequestId(db, broadcast.id, requestId, null);
     await createBroadcastInsight(db, broadcast.id);
-    await updateBroadcastStatus(db, broadcast.id, 'sent', { totalCount: 0, successCount: 0 });
+    await updateBroadcastStatus(db, broadcast.id, 'sent', { totalCount: followerCount, successCount: followerCount });
     return;
   }
 
@@ -466,6 +572,14 @@ async function processQueuedBroadcastBatches(
 
   // 1回のCron実行で全バッチを処理（タイムアウトしない範囲で）
   while (currentOffset < friends.length) {
+    // Re-check the usage limits between batches: a run that started under the
+    // limit stops as soon as it crosses it, so one run overshoots by at most
+    // one batch. Progress is persisted with the offset unlocked and the next
+    // tick resumes from here once back under the limit.
+    if (quotaEnv && (await isQuotaExceeded(db, quotaEnv))) {
+      await updateBroadcastBatchProgress(db, broadcast.id, currentOffset, 0);
+      return;
+    }
     const batch = friends.slice(currentOffset, currentOffset + deliveryBatchSize);
     const lineUserIds = batch.map(f => f.line_user_id);
     const batchIndex = Math.floor(currentOffset / deliveryBatchSize);

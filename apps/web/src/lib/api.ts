@@ -284,7 +284,15 @@ export type FriendListItem = FriendWithTags & Partial<{
   handled: boolean
 }>
 
+export type QuotaUsage = {
+  friends: { used: number; max: number }
+  monthlyMessages: { used: number; max: number }
+  exceeded: boolean
+  noticeUrl: string | null
+}
+
 export const api = {
+  usage: () => fetchApi<ApiResponse<QuotaUsage>>('/api/usage'),
   friends: {
     list: (params?: FriendListParams) => {
       const query: Record<string, string> = {}
@@ -1669,6 +1677,9 @@ export interface BookingStaff {
   sort_order: number;
   is_designation_optional: number;
   is_active: number;
+  // 1 if the staff has an active weekly rule or a future dated shift.
+  // Only present on list responses (computed by the worker).
+  has_working_hours?: number;
 }
 
 export interface BookingShift {

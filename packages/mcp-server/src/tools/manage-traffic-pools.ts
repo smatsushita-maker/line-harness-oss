@@ -28,9 +28,9 @@ export function registerManageTrafficPools(server: McpServer): void {
     {
       action: z.enum(["list", "create", "update", "delete", "list_accounts", "add_account", "remove_account", "toggle_account"]).describe("Action to perform"),
       poolId: z.string().optional().describe("Pool ID (required for update, delete)"),
-      slug: z.string().optional().describe("URL slug e.g. 'main' (for create)"),
-      name: z.string().optional().describe("Pool name (for create, update)"),
-      activeAccountId: z.string().optional().describe("LINE account ID to route traffic to (for create, update)"),
+      slug: z.string().optional().describe("URL slug e.g. 'main' (required for create)"),
+      name: z.string().optional().describe("Pool name (required for create; optional for update)"),
+      activeAccountId: z.string().optional().describe("LINE account ID to route traffic to (required for create; optional for update)"),
       isActive: z.boolean().optional().describe("Enable/disable the pool (for update)"),
       lineAccountId: z.string().optional().describe("LINE account ID (for add_account)"),
       poolAccountId: z.string().optional().describe("Pool account ID (for remove_account, toggle_account)"),

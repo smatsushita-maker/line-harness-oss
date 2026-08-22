@@ -502,3 +502,28 @@ describe('POST /api/rich-menu-groups/:groupId/publish', () => {
     expect(dbMocks.releasePublishLock).toHaveBeenCalledWith(expect.anything(), 'gid12345-aaaa');
   });
 });
+
+// ----- GET /api/rich-menu-images/:key (auth-exempt public route) -----
+
+describe('GET /api/rich-menu-images/:key', () => {
+  test('serves objects under rich-menus/', async () => {
+    const r2 = makeR2Stub();
+    await r2.put('rich-menus/acc1/g1/p1/1.png', new Uint8Array([1, 2, 3]), {
+      httpMetadata: { contentType: 'image/png' },
+    });
+    const app = setupApp({ r2 });
+    const res = await app.request('/api/rich-menu-images/rich-menus/acc1/g1/p1/1.png');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toBe('image/png');
+  });
+
+  test('never serves objects outside rich-menus/ (e.g. messages_log archives)', async () => {
+    const r2 = makeR2Stub();
+    await r2.put('archive/messages_log/2026-01-01/m1.ndjson', new TextEncoder().encode('secret'), {
+      httpMetadata: { contentType: 'application/x-ndjson' },
+    });
+    const app = setupApp({ r2 });
+    const res = await app.request('/api/rich-menu-images/archive/messages_log/2026-01-01/m1.ndjson');
+    expect(res.status).toBe(404);
+  });
+});

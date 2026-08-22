@@ -107,6 +107,7 @@ export default function BookingStaffPage() {
                   <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">スタッフ</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">役職</th>
                   <th className="px-4 py-3 text-center text-xs font-semibold text-gray-500 uppercase">指名なし枠</th>
+                  <th className="px-4 py-3 text-center text-xs font-semibold text-gray-500 uppercase">受付時間</th>
                   <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase">並び順</th>
                   <th className="px-4 py-3 text-center text-xs font-semibold text-gray-500 uppercase">有効</th>
                   <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase">操作</th>
@@ -140,6 +141,21 @@ export default function BookingStaffPage() {
                     <td className="px-4 py-3 text-center">
                       {s.is_designation_optional ? (
                         <span className="inline-block px-2 py-0.5 rounded bg-purple-100 text-purple-700 text-xs">指名なし</span>
+                      ) : (
+                        <span className="text-xs text-gray-300">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-center">
+                      {s.has_working_hours === 0 ? (
+                        <Link
+                          href={`/booking/staff/shifts?staff_id=${s.id}`}
+                          className="inline-block px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-xs hover:bg-amber-200"
+                          title="受付時間を保存するまで、このスタッフの予約枠は表示されません"
+                        >
+                          未設定
+                        </Link>
+                      ) : s.has_working_hours === 1 ? (
+                        <span className="inline-block px-2 py-0.5 rounded bg-green-100 text-green-800 text-xs">設定済み</span>
                       ) : (
                         <span className="text-xs text-gray-300">-</span>
                       )}

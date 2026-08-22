@@ -8,6 +8,7 @@ import {
   getRandomPoolAccount,
   getPoolAccounts,
   getEntryRouteByRefCode,
+  getLineAccountByChannelId,
   getLineAccountById,
   getAffiliateLinkByRefCode,
   incrementAffiliateLinkClick,
@@ -16,6 +17,7 @@ import {
 } from '@line-crm/db';
 import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts, processQueuedBroadcasts } from './services/broadcast.js';
+import { startBulkSendJobs } from './services/quota.js';
 import { processReminderDeliveries } from './services/reminder-delivery.js';
 import { checkAccountHealth } from './services/ban-monitor.js';
 import { refreshLineAccessTokens } from './services/token-refresh.js';
@@ -25,6 +27,7 @@ import { runExpirer } from './services/booking-expirer.js';
 import { processDueEventReminders } from './services/event-booking-reminders.js';
 import { processDueMeetConsultationReminders } from './services/meet-consultation-reminders.js';
 import { runEventBookingExpirer } from './services/event-booking-expirer.js';
+import { logRetentionDays } from './services/log-retention.js';
 import { sendEventBookingNotification } from './services/event-booking-notifier.js';
 import { sendBookingNotification } from './services/booking-notifier.js';
 import { DEFAULT_ACCOUNT_SETTINGS } from './services/booking-types.js';
@@ -42,6 +45,7 @@ import { affiliates } from './routes/affiliates.js';
 import { affiliateOffers } from './routes/affiliate-offers.js';
 import { duplicates } from './routes/duplicates.js';
 import { usersGrouped } from './routes/users-grouped.js';
+import { usage } from './routes/usage.js';
 import { inbox } from './routes/inbox.js';
 import { openapi } from './routes/openapi.js';
 import { liffRoutes } from './routes/liff.js';
@@ -87,9 +91,11 @@ import { webinarRoutes } from './routes/webinars.js';
 import { instagramEngagement } from './routes/instagram-engagement.js';
 import adminVersion from './routes/admin-version.js';
 import adminUpdate from './routes/admin-update.js';
+import { adminSso } from './routes/admin-sso.js';
 import { mediaInquiries } from './routes/media-inquiries.js';
 import { isLinkPreviewBot } from './lib/og-bot.js';
 import { buildOgHtml } from './lib/og-html.js';
+import { loginUnconfiguredPage } from './lib/login-unconfigured.js';
 import {
   resolveOgForEvent,
   resolveOgForForm,
@@ -114,6 +120,11 @@ export type Env = {
     ADMIN_ORIGIN?: string;          // Comma-separated admin web origin allowlist for credentialed CORS
     ADMIN_COOKIE_SAMESITE?: string; // Optional override: 'Strict' | 'Lax' | 'None'
     ADMIN_ALLOW_CROSS_SITE?: string; // 'true' opts into SameSite=None cross-site cookies
+    // External SSO into the admin session (GET /admin/sso). Optional: when the
+    // secret is unset the route answers like any unregistered path, so the
+    // feature is entirely absent unless an operator opts in. ≥32 chars, shared
+    // with the token issuer. See routes/admin-sso.ts and docs/ADMIN-AUTH.md.
+    ADMIN_SSO_SECRET?: string;
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
@@ -141,6 +152,14 @@ export type Env = {
     // the Worker keeps a refresh token and never needs a service-account key.
     GOOGLE_OAUTH_CLIENT_ID?: string;
     GOOGLE_OAUTH_CLIENT_SECRET?: string;
+    /** Days to keep messages_log rows. Unset/invalid = keep forever. */
+    LOG_RETENTION_DAYS?: string;
+    /** Max friends (is_following=1). Unset/invalid = unlimited. */
+    QUOTA_FRIENDS_MAX?: string;
+    /** Max outgoing push messages per JST month. Unset/invalid = unlimited. */
+    QUOTA_MONTHLY_MESSAGES_MAX?: string;
+    /** Optional URL shown to admins when a quota is exceeded. */
+    QUOTA_NOTICE_URL?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -195,6 +214,7 @@ app.route('/', affiliates);
 app.route('/', affiliateOffers);
 app.route('/', duplicates);
 app.route('/', usersGrouped);
+app.route('/', usage);
 app.route('/', inbox);
 app.route('/', openapi);
 app.route('/', liffRoutes);
@@ -247,6 +267,10 @@ app.route('/admin', adminVersion);
 // Phase 5 Task 18 — self-update endpoints guarded by x-admin-api-key.
 // authMiddleware skips non-/api/ paths so this router owns its own auth gate.
 app.route('/admin/update', adminUpdate);
+// External SSO — establishes the admin session from a signed, single-use token.
+// Inert (404) unless ADMIN_SSO_SECRET is configured. authMiddleware skips
+// non-/api/ paths, so this route owns its own verification.
+app.route('/', adminSso);
 
 // Self-hosted QR code proxy — prevents leaking ref tokens to third-party services
 app.get('/api/qr', async (c) => {
@@ -274,11 +298,28 @@ app.get('/r/:ref', async (c) => {
   const formId = c.req.query('form') || '';
 
   // Resolve LIFF URL — priority:
+  //   0. URL query ?account= (explicit single-account pin — admin-issued
+  //      per-account links must never be re-routed by a colliding ref_code)
   //   1. entry_route.pool_id (if ref maps to a referral link)
   //   2. URL query ?pool=
   //   3. 'main' fallback
   let liffUrl = c.env.LIFF_URL;
   let pool: Awaited<ReturnType<typeof getTrafficPoolBySlug>> | null = null;
+
+  // 0. ?account= pins the destination account and wins over any ref-derived
+  // pool/affiliate resolution. The ref still rides through to LIFF below, so
+  // attribution (friends.ref_code / ref_tracking via /api/liff/link) keeps
+  // working; only the account choice is fixed. Unknown channel_id or an
+  // account without liff_id falls through to the normal resolution chain.
+  const accountParam = c.req.query('account') || '';
+  let accountResolved = false;
+  if (accountParam) {
+    const account = await getLineAccountByChannelId(c.env.DB, accountParam);
+    if (account?.liff_id) {
+      liffUrl = `https://liff.line.me/${account.liff_id}`;
+      accountResolved = true;
+    }
+  }
 
   // 1. entry_route lookup. getTrafficPoolById (unlike getTrafficPoolBySlug)
   // does not filter on is_active, so we ignore disabled pools explicitly to
@@ -290,7 +331,7 @@ app.get('/r/:ref', async (c) => {
   // double-count every successful click in getEntryRouteFunnel. Landing-page
   // drop-off (clicks that never reach OAuth) is therefore not visible in the
   // funnel; that limitation is intentional pending a dedicated click table.
-  const route = await getEntryRouteByRefCode(c.env.DB, ref);
+  const route = accountResolved ? null : await getEntryRouteByRefCode(c.env.DB, ref);
   if (route?.pool_id) {
     const candidate = await getTrafficPoolById(c.env.DB, route.pool_id);
     if (candidate?.is_active) pool = candidate;
@@ -306,7 +347,7 @@ app.get('/r/:ref', async (c) => {
   // through to LIFF state below so the existing ref_tracking flow attributes
   // the eventual friend-add via /auth/callback + /api/liff/link.
   let affiliateResolved = false;
-  if (!route) {
+  if (!route && !accountResolved) {
     const affiliateLink = await getAffiliateLinkByRefCode(c.env.DB, ref);
     if (affiliateLink) {
       await incrementAffiliateLinkClick(c.env.DB, ref);
@@ -322,7 +363,7 @@ app.get('/r/:ref', async (c) => {
   // 2 / 3. fallback to URL query or 'main'. Skipped for affiliate refs, whose
   // account is already resolved above; falling through to the 'main' pool would
   // override the affiliate's chosen account.
-  if (!pool && !affiliateResolved) {
+  if (!pool && !affiliateResolved && !accountResolved) {
     const poolSlug = c.req.query('pool') || 'main';
     pool = await getTrafficPoolBySlug(c.env.DB, poolSlug);
   }
@@ -339,12 +380,21 @@ app.get('/r/:ref', async (c) => {
     }
   }
 
+  // L Harness Cloud tenants are provisioned without LIFF config. When neither
+  // env LIFF_URL nor the resolved pool/affiliate account provides one,
+  // `liffUrl.match()` below throws on undefined (500) — return setup guidance.
+  if (!liffUrl) {
+    return c.html(loginUnconfiguredPage(), 503);
+  }
+
   // Build LIFF URL with params (direct link for Universal Link)
   const liffIdMatch = liffUrl.match(/liff\.line\.me\/([0-9]+-[A-Za-z0-9]+)/);
   const liffParams = new URLSearchParams();
   if (liffIdMatch) liffParams.set('liffId', liffIdMatch[1]);
   if (ref) liffParams.set('ref', ref);
   if (formId) liffParams.set('form', formId);
+  // Parity with /auth/line's qrParams — keeps the account hint on the LIFF URL.
+  if (accountParam) liffParams.set('account', accountParam);
   const gate = c.req.query('gate');
   if (gate) liffParams.set('gate', gate);
   const xh = c.req.query('xh');
@@ -1025,13 +1075,18 @@ async function scheduled(
   // (barrier 化すると長い scheduled 送信が queue 処理を待たせる)。scheduled dedup は
   // status='sending', batch_offset=0 に enqueue され、同 tick もしくは次 tick (最大5分、
   // 5分 cron の粒度内) で processQueuedBroadcasts に拾われて分割送信される。
+  //
+  // 例外: 月間送信上限が設定されているときだけ、この配信3ジョブは
+  // startBulkSendJobs が直列 (queued → scheduled → step) に切り替える。並列だと
+  // 各ジョブが自分のスナップショットしか見ず合算で上限を超えられるため。
+  // リマインダー等クォータ対象外のジョブは従来どおり常に並列。
   const jobs = [];
-  jobs.push(
-    processStepDeliveries(env.DB, defaultLineClient, env.WORKER_URL),
-    processScheduledBroadcasts(env.DB, defaultLineClient, env.WORKER_URL),
-    processReminderDeliveries(env.DB, defaultLineClient),
-  );
-  jobs.push(processQueuedBroadcasts(env.DB, defaultLineClient, env.WORKER_URL));
+  jobs.push(...startBulkSendJobs(env, [
+    () => processQueuedBroadcasts(env.DB, defaultLineClient, env.WORKER_URL, env),
+    () => processScheduledBroadcasts(env.DB, defaultLineClient, env.WORKER_URL, env),
+    () => processStepDeliveries(env.DB, defaultLineClient, env.WORKER_URL, env),
+  ]));
+  jobs.push(processReminderDeliveries(env.DB, defaultLineClient));
   jobs.push(checkAccountHealth(env.DB));
 
   // Mileage is an eventually-consistent projection. Reuse the existing
@@ -1098,6 +1153,22 @@ async function scheduled(
       );
     } catch (e) {
       console.error('event-booking-expirer error:', e);
+    }
+
+    // Message-log retention (opt-in via LOG_RETENTION_DAYS; unset = keep forever).
+    // Runs last: it only frees storage, so every delivery job outranks it.
+    if (logRetentionDays(env) > 0) {
+      try {
+        const { runLogRetention } = await import('./services/log-retention.js');
+        const res = await runLogRetention(env.DB, env.IMAGES, env);
+        if (res.archived > 0) {
+          console.log(
+            `log-retention: archived ${res.archived} rows in ${res.batches} batch(es)`,
+          );
+        }
+      } catch (err) {
+        console.error('log-retention failed:', err);
+      }
     }
   }
 

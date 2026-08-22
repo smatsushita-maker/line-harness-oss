@@ -9,6 +9,16 @@ import {
 import type { Broadcast as DbBroadcast, BroadcastMessageType, BroadcastTargetType } from '@line-crm/db';
 import { LineClient } from '@line-crm/line-sdk';
 import { processBroadcastSend, buildMessage, processQueuedBroadcasts } from '../services/broadcast.js';
+import {
+  getQuotaUsage,
+  wouldExceedMonthlyQuota,
+  estimateSendAudience,
+  personalizedAudienceFilter,
+  personalizedAudienceCount,
+  queuedTagAudienceCount,
+  quotaConfig,
+  monthStartJst,
+} from '../services/quota.js';
 import { computeDedupBroadcastPreview } from '../services/dedup-broadcast.js';
 import { processSegmentSend } from '../services/segment-send.js';
 import type { SegmentCondition } from '../services/segment-query.js';
@@ -46,6 +56,20 @@ function parseJsonArray(s: unknown): string[] | null {
   try {
     const parsed = JSON.parse(s);
     return Array.isArray(parsed) ? (parsed as string[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonObject(s: unknown): Record<string, unknown> | null {
+  if (!s) return null;
+  if (typeof s === 'object') return s as Record<string, unknown>;
+  if (typeof s !== 'string') return null;
+  try {
+    const parsed = JSON.parse(s);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
@@ -98,6 +122,12 @@ function serializeBroadcast(row: DbBroadcast) {
     lineRequestId: r.line_request_id || null,
     aggregationUnit: r.aggregation_unit || null,
     lineAccountId: r.line_account_id || null,
+    // A segment send is stored with target_type='all' (the recipient set is
+    // resolved from these conditions, not from the table), so without this
+    // field a caller reading history cannot tell it apart from a real
+    // send-to-everyone. Note tag sends over 500 recipients also carry a
+    // tag_exists marker here — target_type stays 'tag' for those.
+    segmentConditions: parseJsonObject(r.segment_conditions),
     accountIds: parseJsonArray(r.account_ids),
     dedupPriority: parseJsonArray(r.dedup_priority),
     failedAccountIds: parseJsonArray(r.failed_account_ids),
@@ -355,6 +385,13 @@ broadcasts.post('/api/broadcasts', async (c) => {
       }
     }
 
+    // NOTE: do not "helpfully" fill in line_account_id when the caller omits it.
+    // A NULL here does leave messages_log.line_account_id NULL (so those sends fall
+    // out of per-account views), but pinning an account changes *who receives the
+    // broadcast*: the queued tag/segment executors filter recipients with a strict
+    // `f.line_account_id = ?`, so friends carrying a legacy NULL account_id would be
+    // silently dropped from the audience. Callers that want per-account attribution
+    // should pass accountId explicitly.
     let broadcast: DbBroadcast;
     try {
       broadcast = await createBroadcast(c.env.DB, {
@@ -400,6 +437,15 @@ broadcasts.put('/api/broadcasts/:id', async (c) => {
 
     if (!existing) {
       return c.json({ success: false, error: 'Broadcast not found' }, 404);
+    }
+
+    // The edit path below clears success_count / sent_at / line_request_id —
+    // for a current-month usage record that would erase spent budget, so it
+    // is refused with the same lock as DELETE. Checked before the status
+    // gate: the lock must hold even for rows the status check would let
+    // through (defense in depth against status-gate races or loosening).
+    if (isLockedUsageRecord(c.env, existing)) {
+      return c.json({ success: false, error: 'usage_record_locked' }, 403);
     }
 
     if (existing.status !== 'draft' && existing.status !== 'scheduled') {
@@ -481,6 +527,15 @@ broadcasts.put('/api/broadcasts/:id', async (c) => {
 broadcasts.delete('/api/broadcasts/:id', async (c) => {
   try {
     const id = c.req.param('id');
+    // Current-month usage records are locked until the month rolls over (see
+    // isLockedUsageRecord). With no monthly limit configured the fetch is
+    // skipped and deletion behaves exactly as before.
+    if (quotaConfig(c.env).monthlyMessagesMax > 0) {
+      const existing = await getBroadcastById(c.env.DB, id);
+      if (isLockedUsageRecord(c.env, existing)) {
+        return c.json({ success: false, error: 'usage_record_locked' }, 403);
+      }
+    }
     await deleteBroadcast(c.env.DB, id);
     return c.json({ success: true, data: null });
   } catch (err) {
@@ -488,6 +543,28 @@ broadcasts.delete('/api/broadcasts/:id', async (c) => {
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
+
+/**
+ * True when this row is the current JST month's only durable usage record: a
+ * sent all-target (broadcast API) send wrote no per-recipient messages_log
+ * rows, so its broadcasts row (line_request_id set, sent_at in this month) IS
+ * the tally (see services/quota.ts). While a monthly limit is active such
+ * rows must be neither deleted nor edited — both would erase spent budget.
+ * Shared by the DELETE and PUT guards so the condition cannot drift.
+ */
+function isLockedUsageRecord(
+  env: { QUOTA_MONTHLY_MESSAGES_MAX?: string },
+  existing: DbBroadcast | null,
+): boolean {
+  if (quotaConfig(env).monthlyMessagesMax === 0) return false;
+  if (!existing || existing.target_type !== 'all') return false;
+  const lineRequestId = (existing as unknown as Record<string, unknown>).line_request_id;
+  return (
+    lineRequestId != null
+    && typeof existing.sent_at === 'string'
+    && existing.sent_at >= monthStartJst()
+  );
+}
 
 // POST /api/broadcasts/:id/send - send now (tag配信で500人超はキュー方式)
 //
@@ -510,33 +587,62 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
       return c.json({ success: false, error: variableError }, 400);
     }
 
+    // Opt-in usage quota: while over the limit, bulk sends are refused with a
+    // structured 403 the admin UI can explain (1:1 replies are unaffected).
+    const quota = await getQuotaUsage(c.env.DB, c.env);
+    if (quota.exceeded) {
+      return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
+    }
+    // Also refuse when the projected total would cross the monthly limit, so
+    // one big send just under the limit cannot overshoot it wholesale.
+    //
+    // The personalized branch below is exempt from this generic estimate: its
+    // queued per-recipient send filters by the broadcast's account, while the
+    // generic tag estimate is deliberately unfiltered (it mirrors the
+    // non-personalized getFriendsByTag path). Judging a personalized
+    // account-bound tag send by the unfiltered count would over-estimate and
+    // refuse sends that actually fit — the branch applies the same refusal
+    // with its own exact audience count instead.
+    const personalizedSend = hasRecipientVariables(existing.message_content)
+      && existing.target_type !== 'multi-account-dedup';
+    if (!personalizedSend && quota.monthlyMessages.max > 0) {
+      let estimate = await estimateSendAudience(c.env.DB, existing);
+      // A tag send with more than 500 following members — the same threshold
+      // this route uses below to switch to the queued path — is delivered by
+      // the queue executor via a tag marker: NO is_following rule, and the
+      // broadcast's account filter only when one is set. Judge those by that
+      // exact population (queuedTagAudienceCount mirrors both variants);
+      // smaller tag sends stay inline via getFriendsByTag (unfiltered,
+      // following only), which the generic estimate above already mirrors.
+      if (
+        existing.target_type === 'tag'
+        && estimate !== null
+        && estimate > 500
+      ) {
+        estimate = await queuedTagAudienceCount(c.env.DB, existing);
+      }
+      if (wouldExceedMonthlyQuota(quota, estimate)) {
+        return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
+      }
+    }
+
     // LINE's multicast/broadcast endpoints accept one shared Message object;
     // recipient-name variables therefore require per-friend push delivery.
     // Queue these even for a small audience so they run within Worker limits.
-    if (hasRecipientVariables(existing.message_content)
-      && existing.target_type !== 'multi-account-dedup') {
-      const rawExisting = existing as unknown as Record<string, unknown>;
-      const accountId = rawExisting.line_account_id as string | null;
-      const where: string[] = ['f.is_following = 1'];
-      const binds: unknown[] = [];
-      if (accountId) {
-        where.push('f.line_account_id = ?');
-        binds.push(accountId);
-      }
-      if (existing.target_type === 'tag') {
-        if (!existing.target_tag_id) {
-          return c.json({ success: false, error: 'targetTagId is required for tag delivery' }, 400);
-        }
-        where.push('EXISTS (SELECT 1 FROM friend_tags ft WHERE ft.friend_id = f.id AND ft.tag_id = ?)');
-        binds.push(existing.target_tag_id);
+    if (personalizedSend) {
+      // Audience filter shared with the scheduled pre-claim guard
+      // (personalizedAudienceCount in services/quota.ts) — single definition.
+      const filter = personalizedAudienceFilter(existing);
+      if (!filter) {
+        return c.json({ success: false, error: 'targetTagId is required for tag delivery' }, 400);
       }
 
       const audience = await c.env.DB.prepare(
         `SELECT COUNT(*) AS total,
                 SUM(CASE WHEN f.display_name IS NULL OR trim(f.display_name) = '' THEN 1 ELSE 0 END) AS missing_name
            FROM friends f
-          WHERE ${where.join(' AND ')}`,
-      ).bind(...binds).first<{ total: number; missing_name: number | null }>();
+          WHERE ${filter.where}`,
+      ).bind(...filter.binds).first<{ total: number; missing_name: number | null }>();
       const total = Number(audience?.total ?? 0);
       const missingName = Number(audience?.missing_name ?? 0);
       if (missingName > 0) {
@@ -544,6 +650,13 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
           success: false,
           error: `Cannot personalize broadcast: ${missingName} recipient(s) have no display name`,
         }, 400);
+      }
+
+      // Same projected-audience refusal as the other targets, using this
+      // branch's exact audience count — the same WHERE (account filter
+      // included) that the queued personalized send will deliver to.
+      if (quota.monthlyMessages.max > 0 && wouldExceedMonthlyQuota(quota, total)) {
+        return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
       }
 
       const conditions: SegmentCondition = existing.target_type === 'tag'
@@ -565,7 +678,7 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
         const ctx = c.executionCtx as ExecutionContext;
         const defaultClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
         ctx.waitUntil(
-          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL).catch((err) => {
+          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL, c.env).catch((err) => {
             console.error('[personalized-broadcast] background queue processing failed:', err);
           }),
         );
@@ -621,6 +734,14 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
         }, 400);
       }
 
+      // Same projected-audience refusal as the other targets, before the
+      // claim. estimateSendAudience returns null for dedup (no cheap COUNT),
+      // so the generic guard above cannot cover this branch — but the branch
+      // already computes projectedTotal from the preview, so apply it here.
+      if (quota.monthlyMessages.max > 0 && wouldExceedMonthlyQuota(quota, projectedTotal)) {
+        return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
+      }
+
       const lockResult = await c.env.DB.prepare(
         `UPDATE broadcasts SET status = 'sending', batch_offset = 0, total_count = ? WHERE id = ? AND status IN ('draft','scheduled')`
       ).bind(projectedTotal, id).run();
@@ -636,7 +757,7 @@ broadcasts.post('/api/broadcasts/:id/send', async (c) => {
         const ctx = c.executionCtx as ExecutionContext;
         const defaultClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
         ctx.waitUntil(
-          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL).catch((err) => {
+          processQueuedBroadcasts(c.env.DB, defaultClient, c.env.WORKER_URL, c.env).catch((err) => {
             console.error('[multi-account-dedup] background queue processing failed:', err);
           }),
         );
@@ -749,6 +870,28 @@ broadcasts.post('/api/broadcasts/:id/send-segment', async (c) => {
     const variableError = unsupportedVariablesError(existing.message_content);
     if (variableError) {
       return c.json({ success: false, error: variableError }, 400);
+    }
+
+    // Same opt-in usage quota gate as /send (bulk sends only), including the
+    // projected-total check — the segment COUNT is a single cheap query.
+    const quota = await getQuotaUsage(c.env.DB, c.env);
+    if (quota.exceeded) {
+      return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
+    }
+    if (quota.monthlyMessages.max > 0) {
+      const { buildSegmentQuery } = await import('../services/segment-query.js');
+      const { sql, bindings } = buildSegmentQuery(body.conditions);
+      const segAccountId = (existing as unknown as Record<string, unknown>).line_account_id as string | null;
+      let countSql = `SELECT COUNT(*) as count FROM (${sql}) q`;
+      const countBindings = [...bindings];
+      if (segAccountId) {
+        countSql = `SELECT COUNT(*) as count FROM (${sql.replace('WHERE', 'WHERE f.line_account_id = ? AND')}) q`;
+        countBindings.unshift(segAccountId);
+      }
+      const segCount = await c.env.DB.prepare(countSql).bind(...countBindings).first<{ count: number }>();
+      if (wouldExceedMonthlyQuota(quota, segCount?.count ?? 0)) {
+        return c.json({ success: false, error: 'quota_exceeded', quota }, 403);
+      }
     }
 
     if (hasRecipientVariables(existing.message_content)) {

@@ -58,6 +58,8 @@ const U = (n: number) => `U${n.toString(16).padStart(32, '0')}`;
 function fakeDb(opts: {
   friendsByUserId?: Record<string, { id: string; line_user_id: string }>;
   broadcastFriendIds?: string[];
+  /** Quota tallies: COUNT answers for the usage-limit gate. */
+  counts?: { monthly?: number; friends?: number; knownRecipients?: number };
 } = {}) {
   const executed: Exec[] = [];
   const db = {
@@ -84,6 +86,13 @@ function fakeDb(opts: {
           return { results: (opts.broadcastFriendIds ?? []).map((id) => ({ id })) };
         },
         async first() {
+          executed.push({ sql, params: stmt.params });
+          if (sql.includes('FROM messages_log')) return { count: opts.counts?.monthly ?? 0 };
+          if (sql.includes('SUM(success_count)')) return { count: 0 };
+          if (sql.includes('COUNT(DISTINCT line_user_id)')) {
+            return { count: opts.counts?.knownRecipients ?? 0 };
+          }
+          if (sql.includes('FROM friends')) return { count: opts.counts?.friends ?? 0 };
           return null;
         },
       };
@@ -536,7 +545,7 @@ describe('broadcast', () => {
     expect(loggedRows(executed)).toHaveLength(2);
   });
 
-  test('multi-account: scoped to the sending account', async () => {
+  test('multi-account: scoped to the sending account, legacy NULL rows included', async () => {
     vi.mocked(getLineAccounts).mockResolvedValue([ACCOUNT, ACCOUNT_2] as never);
     const { db, executed } = fakeDb({ broadcastFriendIds: ['f1', 'f2'] });
     const res = await setupApp().request(
@@ -550,7 +559,11 @@ describe('broadcast', () => {
     );
     expect(res.status).toBe(200);
     const select = executed.find((e) => e.sql.includes('SELECT id FROM friends'));
-    expect(select!.sql).toContain('line_account_id = ?');
+    // Must match the projection population (estimateSendAudience): legacy
+    // NULL-account rows receive the broadcast too, so they are logged — an
+    // account-only filter would under-record every send and let usage drift
+    // below reality.
+    expect(select!.sql).toContain('(line_account_id = ? OR line_account_id IS NULL)');
     expect(select!.params).toEqual(['acc-2']);
     expect(loggedRows(executed)).toHaveLength(2);
   });
@@ -675,5 +688,223 @@ describe('reply and passthrough', () => {
     );
     expect(res.status).toBe(413);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('usage limit gate', () => {
+  const quotaEnv = { QUOTA_MONTHLY_MESSAGES_MAX: '5000' };
+
+  function broadcastRequest(token = 'acc-token') {
+    return new Request('http://worker.test/line-api/v2/bot/message/broadcast', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [{ type: 'text', text: 'to everyone' }] }),
+    });
+  }
+
+  function multicastRequest(recipients: number, messageCount = 1) {
+    return new Request('http://worker.test/line-api/v2/bot/message/multicast', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer acc-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to: Array.from({ length: recipients }, (_, i) => U(0x500 + i)),
+        messages: Array.from({ length: messageCount }, (_, i) => ({ type: 'text', text: `hi ${i}` })),
+      }),
+    });
+  }
+
+  test('broadcast while over the limit → LINE-shaped 429, upstream not called', async () => {
+    const { db } = fakeDb({ counts: { monthly: 5000 } });
+    const res = await setupApp().request(broadcastRequest(), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(429);
+    const body = await res.json() as { message: string };
+    expect(typeof body.message).toBe('string');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('broadcast whose projected follower count would cross the limit → 429', async () => {
+    // 4999 used + 500 followers = 5499 > 5000.
+    const { db } = fakeDb({ counts: { monthly: 4999, friends: 500 } });
+    const res = await setupApp().request(broadcastRequest(), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('multicast projected by its recipient count: over blocks, within passes', async () => {
+    const over = fakeDb({ counts: { monthly: 4999 } });
+    const resOver = await setupApp().request(multicastRequest(3), {}, { ...env(over.db), ...quotaEnv });
+    expect(resOver.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const fits = fakeDb({ counts: { monthly: 100 } });
+    const resFits = await setupApp().request(multicastRequest(3), {}, { ...env(fits.db), ...quotaEnv });
+    expect(resFits.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('multicast projection multiplies recipients by message count (one row per recipient per message)', async () => {
+    // 4 sends left (4996 of 5000). 2 recipients x 3 messages = 6 rows → 429.
+    const over = fakeDb({ counts: { monthly: 4996 } });
+    const resOver = await setupApp().request(multicastRequest(2, 3), {}, { ...env(over.db), ...quotaEnv });
+    expect(resOver.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // 2 recipients x 1 message = 2 rows → fits in the remaining 4, forwarded.
+    const fits = fakeDb({ counts: { monthly: 4996 } });
+    const resFits = await setupApp().request(multicastRequest(2, 1), {}, { ...env(fits.db), ...quotaEnv });
+    expect(resFits.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  function fakeCtx() {
+    const captured: Promise<unknown>[] = [];
+    return {
+      captured,
+      ctx: {
+        waitUntil: (p: Promise<unknown>) => { captured.push(p); },
+        passThroughOnException: () => {},
+      } as ExecutionContext,
+    };
+  }
+
+  test('monthly limit active: bulk-send logging completes before the response (sequential rapid fire is gated)', async () => {
+    const { db, executed } = fakeDb({
+      counts: { monthly: 0 },
+      friendsByUserId: {
+        [U(0x500)]: { id: 'k1', line_user_id: U(0x500) },
+        [U(0x501)]: { id: 'k2', line_user_id: U(0x501) },
+      },
+    });
+    const { ctx, captured } = fakeCtx();
+    const res = await setupApp().request(multicastRequest(2), {}, { ...env(db), ...quotaEnv }, ctx);
+    expect(res.status).toBe(200);
+    // Rows are already durable when the client gets its 200 — the next
+    // request's gate sees them.
+    expect(loggedRows(executed).length).toBeGreaterThan(0);
+    expect(captured).toHaveLength(0);
+  });
+
+  test('monthly limit active: 1:1 push keeps background logging', async () => {
+    const { db, executed } = fakeDb({ counts: { monthly: 0 } });
+    const { ctx, captured } = fakeCtx();
+    const res = await setupApp().request(pushRequest('acc-token'), {}, { ...env(db), ...quotaEnv }, ctx);
+    expect(res.status).toBe(200);
+    // Still handed to waitUntil (background), not awaited inline.
+    expect(captured).toHaveLength(1);
+    await Promise.all(captured);
+    expect(loggedRows(executed)).toHaveLength(1);
+  });
+
+  test('no monthly limit: bulk-send logging stays in the background (behavior unchanged)', async () => {
+    const { db, executed } = fakeDb({
+      friendsByUserId: {
+        [U(0x500)]: { id: 'k1', line_user_id: U(0x500) },
+        [U(0x501)]: { id: 'k2', line_user_id: U(0x501) },
+      },
+    });
+    const { ctx, captured } = fakeCtx();
+    const res = await setupApp().request(multicastRequest(2), {}, env(db), ctx);
+    expect(res.status).toBe(200);
+    // Still handed to waitUntil (background), not awaited inline.
+    expect(captured).toHaveLength(1);
+    await Promise.all(captured);
+    expect(loggedRows(executed).length).toBeGreaterThan(0);
+  });
+
+  test('multicast with more unknown recipients than logging can register → 429', async () => {
+    // 25 recipients, none registered: friend creation is capped at 20, so 5
+    // sends would never be recorded — refuse the whole send.
+    const { db } = fakeDb({ counts: { monthly: 0, knownRecipients: 0 } });
+    const res = await setupApp().request(multicastRequest(25), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('multicast whose unknown recipients fit under the creation cap passes', async () => {
+    // 25 recipients, 10 already registered → 15 unknown <= cap of 20.
+    const { db } = fakeDb({ counts: { monthly: 0, knownRecipients: 10 } });
+    const res = await setupApp().request(multicastRequest(25), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('no monthly limit: large unknown multicast passes and runs no recipient COUNT', async () => {
+    const { db, executed } = fakeDb({ counts: { knownRecipients: 0 } });
+    const res = await setupApp().request(multicastRequest(25), {}, env(db));
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(executed.filter((e) => e.sql.includes('COUNT(DISTINCT line_user_id)'))).toEqual([]);
+  });
+
+  test('multi-account install + unregistered env token: broadcast is refused while a monthly limit is active (usage would be unrecordable)', async () => {
+    vi.mocked(getLineAccounts).mockResolvedValue([ACCOUNT, ACCOUNT_2] as never);
+    const { db } = fakeDb({ counts: { monthly: 0, friends: 1 } });
+    const res = await setupApp().request(broadcastRequest('env-token'), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(429);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('single-account install + env token: broadcast is recordable (unscoped log) and passes', async () => {
+    const { db } = fakeDb({ counts: { monthly: 0, friends: 1 }, broadcastFriendIds: ['f1'] });
+    const res = await setupApp().request(broadcastRequest('env-token'), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('no monthly limit: multi-account env-token broadcast passes through as before', async () => {
+    vi.mocked(getLineAccounts).mockResolvedValue([ACCOUNT, ACCOUNT_2] as never);
+    const { db } = fakeDb();
+    const res = await setupApp().request(broadcastRequest('env-token'), {}, env(db));
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('1:1 push passes through even while over the limit (one-to-one is never paused)', async () => {
+    const { db } = fakeDb({ counts: { monthly: 5000 } });
+    const res = await setupApp().request(pushRequest('acc-token'), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  function narrowcastRequest() {
+    return new Request('http://worker.test/line-api/v2/bot/message/narrowcast', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer acc-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ type: 'text', text: 'targeted' }],
+        recipient: { type: 'audience', audienceGroupId: 1 },
+      }),
+    });
+  }
+
+  test('narrowcast while a monthly limit is active → 429, upstream not called (recipients are unknowable)', async () => {
+    const { db } = fakeDb({ counts: { monthly: 0 } });
+    const res = await setupApp().request(narrowcastRequest(), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(429);
+    const body = await res.json() as { message: string };
+    expect(typeof body.message).toBe('string');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('narrowcast with no limits configured passes through as before', async () => {
+    const { db } = fakeDb();
+    const res = await setupApp().request(narrowcastRequest(), {}, env(db));
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('monthly limit active (not exceeded): 1:1 push still passes', async () => {
+    const { db } = fakeDb({ counts: { monthly: 0 } });
+    const res = await setupApp().request(pushRequest('acc-token'), {}, { ...env(db), ...quotaEnv });
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('no limits configured → zero quota queries, behavior unchanged', async () => {
+    const { db, executed } = fakeDb({ counts: { monthly: 999999 } });
+    const res = await setupApp().request(broadcastRequest(), {}, env(db));
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(executed.filter((e) => e.sql.includes('COUNT(*) as count'))).toEqual([]);
   });
 });

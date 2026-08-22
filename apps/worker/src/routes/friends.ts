@@ -509,7 +509,7 @@ friends.delete('/api/friends/:id/tags/:tagId', async (c) => {
   }
 });
 
-// PUT /api/friends/:id/metadata - merge metadata fields
+// PUT /api/friends/:id/metadata - merge metadata fields (null deletes a key)
 friends.put('/api/friends/:id/metadata', async (c) => {
   try {
     const friendId = c.req.param('id');
@@ -523,6 +523,12 @@ friends.put('/api/friends/:id/metadata', async (c) => {
     const body = await c.req.json<Record<string, unknown>>();
     const existing = JSON.parse(friend.metadata || '{}');
     const merged = { ...existing, ...body };
+    // Explicit null deletes the key. A merge-only endpoint has no way to remove
+    // a field once written, so a typo'd or one-off key would be stuck on the
+    // friend forever (storing null instead just leaves visible dead entries).
+    for (const [key, value] of Object.entries(body)) {
+      if (value === null) delete merged[key];
+    }
     const now = jstNow();
 
     await db

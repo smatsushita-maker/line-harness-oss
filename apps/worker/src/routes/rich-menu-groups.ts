@@ -746,6 +746,9 @@ richMenuGroups.post('/api/rich-menu-groups/:groupId/pages/:pageId/image', async 
 // 画像取得 — エディタからの <img src="..."> 用。private cache でアクセス制御は auth に委ねる。
 richMenuGroups.get('/api/rich-menu-images/:key{.+}', async (c) => {
   const key = c.req.param('key');
+  // This path is exempt from authMiddleware (public), so it must never serve
+  // arbitrary bucket objects: editor uploads all live under rich-menus/.
+  if (!key.startsWith('rich-menus/')) return c.notFound();
   const obj = await c.env.IMAGES.get(key);
   if (!obj) return c.notFound();
   return new Response(obj.body, {

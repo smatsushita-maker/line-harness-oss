@@ -71,17 +71,19 @@ function StatCard({ title, value, loading, icon, href, accentColor = '#06C755' }
   )
 }
 
-// 友だち追加リンクの即時取得カード。/auth/line は UUID 付与・アカウント解決・
-// PC では QR ランディング表示までやる正規の流入口なので、共有リンクは常に
-// これを配る (公式の lin.ee 直リンクだと計測も UUID 紐づけも失われる)。
+// 友だち追加リンクの即時取得カード。/r/dashboard は OS 対応ランディング経由で
+// LINE アプリを直接開く流入口（モバイル: LIFF Universal Link / PC: QR）。
+// UUID 付与・アカウント解決は LIFF 側 /api/liff/link が担い、ref=dashboard が
+// friends.ref_code に流入元として記録される。/auth/line?account= を配らないのは
+// モバイルブラウザで Web 版 LINE ログインが挟まり離脱を生むため
+// (公式の lin.ee 直リンクだと計測も UUID 紐づけも失われるのは従来どおり)。
 function FriendAddLinkCard() {
   const { selectedAccount } = useAccount()
   const [copied, setCopied] = useState(false)
-  const [showQr, setShowQr] = useState(false)
   const base = (process.env.NEXT_PUBLIC_API_URL ?? '').replace(/\/$/, '')
   const link = selectedAccount
-    ? `${base}/auth/line?account=${encodeURIComponent(selectedAccount.channelId)}`
-    : `${base}/auth/line`
+    ? `${base}/r/dashboard?account=${encodeURIComponent(selectedAccount.channelId)}`
+    : `${base}/r/dashboard`
 
   const onCopy = async () => {
     try {
@@ -104,13 +106,6 @@ function FriendAddLinkCard() {
               : 'デフォルトアカウントへの追加リンク (UUID計測つき)'}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowQr((v) => !v)}
-          className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 font-medium text-gray-600"
-        >
-          {showQr ? 'QRを隠す' : 'QR表示'}
-        </button>
       </div>
       <div className="flex items-stretch gap-2">
         <input
@@ -128,18 +123,6 @@ function FriendAddLinkCard() {
           {copied ? 'コピーしました ✓' : 'コピー'}
         </button>
       </div>
-      {showQr && (
-        <div className="mt-3 flex justify-center">
-          {/* eslint-disable-next-line @next/next/no-img-element -- worker QR proxy, not a static asset */}
-          <img
-            src={`${base}/api/qr?data=${encodeURIComponent(link)}&size=240x240`}
-            alt="友だち追加QRコード"
-            width={240}
-            height={240}
-            className="border border-gray-200 rounded-lg"
-          />
-        </div>
-      )}
     </div>
   )
 }

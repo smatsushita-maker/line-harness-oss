@@ -200,6 +200,7 @@ import {
 } from './render-message.js';
 import { buildMessage } from './broadcast.js';
 import { createBroadcastRetryKey } from './broadcast-retry-key.js';
+import { isQuotaExceeded, type QuotaEnv } from './quota.js';
 
 const MULTICAST_BATCH_SIZE = 500;
 const PERSONALIZED_PUSH_BATCH_SIZE = 10;
@@ -284,6 +285,38 @@ function parseProgress(raw: string | null | undefined): DedupProgress {
   return empty;
 }
 
+/**
+ * Projected recipient total of a multi-account-dedup broadcast: the preview's
+ * winners summed over active accounts only — the same figure the /send route
+ * computes before claiming, and the same population the executor will
+ * actually message (it skips inactive/missing accounts). Used by the
+ * projected-audience quota guards; dedup has no cheap COUNT, so callers
+ * should invoke this only when a monthly limit is active.
+ */
+export async function projectedDedupAudience(
+  db: D1Database,
+  broadcast: {
+    account_ids: string | null;
+    dedup_priority: string | null;
+    target_tag_id?: string | null;
+  },
+): Promise<number> {
+  const accountIds = (broadcast.account_ids ? JSON.parse(broadcast.account_ids) : []) as string[];
+  const dedupPriority = (broadcast.dedup_priority ? JSON.parse(broadcast.dedup_priority) : []) as string[];
+  const preview = await computeDedupBroadcastPreview(
+    db,
+    accountIds,
+    dedupPriority,
+    broadcast.target_tag_id ?? null,
+  );
+  let total = 0;
+  for (const a of preview.perAccount) {
+    const account = await getLineAccountById(db, a.accountId);
+    if (account && account.is_active) total += a.recipients.length;
+  }
+  return total;
+}
+
 export async function processMultiAccountDedupBroadcast(
   db: D1Database,
   broadcast: {
@@ -298,7 +331,7 @@ export async function processMultiAccountDedupBroadcast(
     aggregation_unit?: string | null;
   },
   lineClientFactory: (token: string) => LineClient = (t) => new LineClient(t),
-  opts: { maxRunMs?: number; now?: () => number } = {},
+  opts: { maxRunMs?: number; now?: () => number; quotaEnv?: QuotaEnv } = {},
 ): Promise<ProcessMultiAccountDedupResult> {
   // 時間バジェット制御 (テストでは clock を注入して yield を決定的に再現できる)。
   // 変数名は clock — batch ループ内の `const now = jstNow()` (timestamp 文字列) と
@@ -393,6 +426,16 @@ export async function processMultiAccountDedupBroadcast(
         // 時間バジェットを超えたら、残りは次の cron tick に回して yield する。
         // ただし最低 1 batch は必ず送る (sentAnyBatch ガード) ことで毎 tick 前進を保証。
         if (sentAnyBatch && clock() - startMs > maxRunMs) {
+          timeExceeded = true;
+          break;
+        }
+
+        // 使用量上限の再チェックも同じ安全境界で行う (直前 batch までの進捗は
+        // db.batch で durable 済み)。超過していたら時間バジェットと同じ経路で
+        // yield し (complete=false → caller が batch_offset を戻す)、1 実行の
+        // はみ出しを最大 1 batch に抑える。上限内に戻った tick で resume する。
+        // 前進保証 (sentAnyBatch) は付けない: 超過中は 1 batch も送らないのが正。
+        if (opts.quotaEnv && (await isQuotaExceeded(db, opts.quotaEnv))) {
           timeExceeded = true;
           break;
         }

@@ -15,6 +15,13 @@ import type { Friend, LineAccount } from '@line-crm/db';
 import { authenticateApiToken } from '../middleware/auth.js';
 import { messageToLogPayload } from '../services/step-delivery.js';
 import type { Env } from '../index.js';
+import {
+  getQuotaUsage,
+  quotaEnabled,
+  quotaConfig,
+  estimateSendAudience,
+  wouldExceedMonthlyQuota,
+} from '../services/quota.js';
 
 /**
  * LINE Messaging API 互換プロキシ。
@@ -171,6 +178,27 @@ async function resolveCaller(c: Context<Env>, token: string): Promise<ResolvedCa
     };
   }
   return c.json({ message: 'No LINE account configured' }, 400);
+}
+
+/**
+ * Number of multicast recipients that have no friends row yet (unique ids,
+ * counted in IN-clause chunks of ≤100 binds — the D1 parameter cap; a typical
+ * multicast of up to 100 recipients is a single SELECT).
+ */
+async function countUnknownRecipients(db: D1Database, userIds: string[]): Promise<number> {
+  const unique = [...new Set(userIds.filter((u): u is string => typeof u === 'string'))];
+  let known = 0;
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    const row = await db
+      .prepare(
+        `SELECT COUNT(DISTINCT line_user_id) as count FROM friends WHERE line_user_id IN (${chunk.map(() => '?').join(', ')})`,
+      )
+      .bind(...chunk)
+      .first<{ count: number }>();
+    known += row?.count ?? 0;
+  }
+  return unique.length - known;
 }
 
 /** Look up friends for a set of userIds in IN-clause chunks (≤100 binds each). */
@@ -373,8 +401,16 @@ async function logProxySend(
           .all<{ id: string }>();
         friendIds = (result.results ?? []).map((r) => r.id);
       } else if (lineAccountId) {
+        // Legacy NULL-account rows receive this channel's broadcast too, so
+        // include them — matching the projection population
+        // (estimateSendAudience). On multi-account installs a NULL row is
+        // thus logged for every account's broadcast; over-recording is the
+        // safe direction for a limiting feature, and an account-only filter
+        // would make recorded usage drift below reality on every send.
         const result = await db
-          .prepare('SELECT id FROM friends WHERE is_following = 1 AND line_account_id = ?')
+          .prepare(
+            'SELECT id FROM friends WHERE is_following = 1 AND (line_account_id = ? OR line_account_id IS NULL)',
+          )
           .bind(lineAccountId)
           .all<{ id: string }>();
         friendIds = (result.results ?? []).map((r) => r.id);
@@ -387,6 +423,11 @@ async function logProxySend(
         );
         return;
       }
+      // delivery_type stays NULL (not 'broadcast') on purpose: the monthly quota
+      // count in line-accounts.ts matches LINE's "delivered messages" dashboard
+      // via `delivery_type IS NULL OR = 'push'`, and a broadcast counts toward
+      // that quota. Tagging these would silently undercount the month. Use
+      // source='external' plus broadcast_id to tell broadcasts apart instead.
       const rows = friendIds.flatMap((friendId) => rowsFor(friendId, null));
       await insertLogRows(db, rows, source);
       console.log(`[line-proxy] broadcast logged for ${friendIds.length} friends`);
@@ -472,6 +513,90 @@ function proxyHandler(prefix: string, upstreamBase: string, logSends: boolean) {
       }
     }
 
+    // Usage-limit gate for the two bulk-send endpoints only. Proxy sends are
+    // recorded in messages_log (they count toward the tally), so they get the
+    // same fences as the built-in send paths: refuse while over a limit, and
+    // refuse a send whose projection (recipient count for multicast, follower
+    // count for broadcast) would cross the monthly limit. 1:1 push and reply
+    // pass through untouched — one-to-one conversations are never paused.
+    // With no limits configured this adds zero queries. The error shape
+    // mirrors the LINE API's own limit response so existing clients handle it.
+    if (
+      isMessageSend
+      && (path === '/v2/bot/message/broadcast'
+        || path === '/v2/bot/message/multicast'
+        || path === '/v2/bot/message/narrowcast')
+      && quotaEnabled(c.env)
+    ) {
+      const usage = await getQuotaUsage(c.env.DB, c.env);
+      let estimate: number | null = null;
+      if (usage.monthlyMessages.max > 0) {
+        // Narrowcast: LINE resolves the audience server-side (demographic /
+        // audience-group targeting), so the worker can neither project the
+        // recipient count nor record the send — logProxySend only warns. A
+        // bulk send whose usage cannot be recorded is not allowed while a
+        // monthly limit is active; without one it passes through as before.
+        if (path === '/v2/bot/message/narrowcast') {
+          return c.json(
+            { message: 'Sends without a determinable recipient list are not available while send limits are active.' },
+            429,
+          );
+        }
+        // A broadcast from an unregistered env token on a multi-account
+        // install is exactly the case logProxySend refuses to log (the
+        // recipient set is unknowable). A send whose usage cannot be recorded
+        // cannot be allowed while a monthly limit is active — it would never
+        // count toward the tally. Register the channel to send broadcasts.
+        if (
+          path === '/v2/bot/message/broadcast'
+          && caller.lineAccountId === null
+          && caller.accountCount > 1
+        ) {
+          return c.json({ message: 'Broadcast requires a registered channel account.' }, 429);
+        }
+        // logProxySend inserts one row per recipient per message, so the
+        // projection multiplies the audience by the messages array length
+        // (LINE allows 1–5 per request). A missing/empty/non-array messages
+        // field falls back to 1 — the upstream rejects such payloads anyway.
+        let toList: unknown[] | null = null;
+        let messageCount = 1;
+        try {
+          const parsed = JSON.parse(rawBody ?? '{}') as { to?: unknown; messages?: unknown };
+          if (Array.isArray(parsed.messages) && parsed.messages.length > 0) {
+            messageCount = parsed.messages.length;
+          }
+          if (Array.isArray(parsed.to)) toList = parsed.to;
+        } catch {
+          // malformed body — no projection, let upstream reject it
+        }
+        if (path === '/v2/bot/message/multicast') {
+          estimate = toList === null ? null : toList.length * messageCount;
+          // logProxySend stops creating friend rows for unknown recipients at
+          // MAX_FRIEND_CREATIONS — anyone beyond the cap would be sent to but
+          // never recorded. A send whose usage cannot be fully recorded is not
+          // allowed while a monthly limit is active, so refuse when more
+          // recipients are unregistered than logging can register. Sends with
+          // at most MAX_FRIEND_CREATIONS recipients can never exceed the cap,
+          // so they skip the COUNT entirely.
+          if (toList && toList.length > MAX_FRIEND_CREATIONS) {
+            const unknown = await countUnknownRecipients(c.env.DB, toList as string[]);
+            if (unknown > MAX_FRIEND_CREATIONS) {
+              return c.json({ message: 'Too many unregistered recipients.' }, 429);
+            }
+          }
+        } else {
+          const followers = await estimateSendAudience(c.env.DB, {
+            target_type: 'all',
+            line_account_id: caller.lineAccountId,
+          } as { target_type: string });
+          estimate = followers === null ? null : followers * messageCount;
+        }
+      }
+      if (usage.exceeded || wouldExceedMonthlyQuota(usage, estimate)) {
+        return c.json({ message: 'You have reached your monthly limit.' }, 429);
+      }
+    }
+
     const headers: Record<string, string> = {
       Authorization: `Bearer ${caller.upstreamToken}`,
     };
@@ -496,11 +621,28 @@ function proxyHandler(prefix: string, upstreamBase: string, logSends: boolean) {
       // Log in the background where possible: a multicast to hundreds of
       // friends must not delay the client response (timeout → client retry →
       // double send). Falls back to inline await outside a Workers runtime.
+      //
+      // Exception: while a monthly send limit is active, bulk sends
+      // (broadcast/multicast) are logged BEFORE the response returns. With
+      // background logging, a client firing sequential bulk sends could pass
+      // the next request's gate before the previous rows landed — awaiting
+      // here makes each 200 mean "already counted", at the cost of added
+      // response latency for these two endpoints only. 1:1 push and reply
+      // keep background logging (they are never gated). Truly concurrent
+      // parallel requests remain a bounded residue (rate limiting caps the
+      // burst width).
       const logging = logProxySend(c.env.DB, caller, path, rawBody, logSource);
-      try {
-        c.executionCtx.waitUntil(logging);
-      } catch {
+      const awaitBeforeResponse =
+        (path === '/v2/bot/message/broadcast' || path === '/v2/bot/message/multicast')
+        && quotaConfig(c.env).monthlyMessagesMax > 0;
+      if (awaitBeforeResponse) {
         await logging;
+      } else {
+        try {
+          c.executionCtx.waitUntil(logging);
+        } catch {
+          await logging;
+        }
       }
     }
 

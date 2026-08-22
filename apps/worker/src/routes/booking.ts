@@ -930,11 +930,17 @@ booking.get('/api/booking/admin/staff', async (c) => {
   if (!accountId) return c.json({ error: 'missing_account_id' }, 400);
   const rows = await c.env.DB
     .prepare(
-      `SELECT id, name, display_name, role, profile_image_url, bio,
-              sort_order, is_designation_optional, is_active
-         FROM staff
-        WHERE line_account_id = ? AND deleted_at IS NULL
-        ORDER BY sort_order ASC, id ASC`,
+      `SELECT s.id, s.name, s.display_name, s.role, s.profile_image_url, s.bio,
+              s.sort_order, s.is_designation_optional, s.is_active,
+              (EXISTS (SELECT 1 FROM staff_availability_rules r
+                        WHERE r.staff_id = s.id AND r.is_active = 1)
+               OR EXISTS (SELECT 1 FROM staff_shifts ss
+                           WHERE ss.staff_id = s.id
+                             AND ss.work_date >= date('now', '+9 hours'))
+              ) AS has_working_hours
+         FROM staff s
+        WHERE s.line_account_id = ? AND s.deleted_at IS NULL
+        ORDER BY s.sort_order ASC, s.id ASC`,
     )
     .bind(accountId)
     .all();
